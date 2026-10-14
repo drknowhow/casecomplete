@@ -1,0 +1,22 @@
+[package]
+name = "cc-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "casecomplete"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+crossbeam-channel.workspace = true
+cc-hook = { path = "../cc-hook" }
+cc-context = { path = "../cc-context" }
+cc-engine = { path = "../cc-engine" }
+cc-overlay = { path = "../cc-overlay" }
+cc-inject = { path = "../cc-inject" }
