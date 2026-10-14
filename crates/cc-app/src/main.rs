@@ -1,4 +1,5 @@
-//! CaseComplete orchestrator (M0 spike). Wires hook -> context -> engine -> overlay -> inject.
+//! CaseComplete orchestrator. Wires hook -> context -> engine -> overlay -> inject.
+#![windows_subsystem = "windows"]
 //!
 //! One orchestrator thread owns all state and receives every event on one channel:
 //! keys from the hook thread, streamed tokens from the engine runtime, and a periodic tick.
@@ -1157,21 +1158,21 @@ fn data_root() -> PathBuf {
 fn main() -> anyhow::Result<()> {
     let root = data_root();
     std::fs::create_dir_all(&root)?;
-    let background = std::env::args().any(|a| a == "--background");
+    // A windowed app: no console unless CC_CONSOLE=1 asks for one; otherwise the log
+    // goes to %LOCALAPPDATA%\CaseComplete\casecomplete.log (truncated past 5 MB).
     let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    if background {
-        // Started by autostart: no console, so the log goes to a file and the console
-        // window that Windows gave us is released.
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.join("casecomplete.log"))
-            .context("open log file")?;
-        logger.target(env_logger::Target::Pipe(Box::new(log)));
-        // SAFETY: plain Win32 call; failure only means there was no console.
+    if std::env::var_os("CC_CONSOLE").is_some() {
+        // SAFETY: plain Win32 call; failure only means a console already exists.
         unsafe {
-            let _ = windows::Win32::System::Console::FreeConsole();
+            let _ = windows::Win32::System::Console::AllocConsole();
         }
+    } else {
+        let path = root.join("casecomplete.log");
+        if std::fs::metadata(&path).map_or(false, |m| m.len() > 5 << 20) {
+            let _ = std::fs::remove_file(&path);
+        }
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(&path).context("open log file")?;
+        logger.target(env_logger::Target::Pipe(Box::new(log)));
     }
     logger.init();
 
