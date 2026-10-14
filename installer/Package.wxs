@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Per-user MSI: installs to %LOCALAPPDATA%\Programs\CaseComplete, no admin needed.
+     Models and llama-server are downloaded by the app on first run into
+     %LOCALAPPDATA%\CaseComplete, so the package stays small. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="CaseComplete"
+           Manufacturer="Dimitri Tselenchuk"
+           Version="$(var.Version)"
+           UpgradeCode="7c2f3a1e-4b7d-4e6a-9c1b-0a5e2d8f6c31"
+           Scope="perUser"
+           Language="1033">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CaseComplete is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon" SourceFile="casecomplete.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="CaseComplete" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="b4d8e2a0-6f3c-4d2e-8a7b-1c9e5f0a3d62">
+        <File Id="CaseCompleteExe" Source="$(var.ExePath)" Name="casecomplete.exe" KeyPath="no" />
+        <!-- Per-user packages key on a registry value, not the file. -->
+        <RegistryValue Root="HKCU" Key="Software\CaseComplete" Name="InstallDir" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="CaseComplete"
+                  Description="Local typing assistant" WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon" Advertise="no" />
+        <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="CaseComplete" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+
+    <!-- Launch after install from the exit dialog. -->
+    <Property Id="WixShellExecTarget" Value="[#CaseCompleteExe]" />
+    <CustomAction Id="LaunchApp" DllEntry="WixShellExec" Impersonate="yes" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp" Condition="NOT Installed OR WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1" />
+    </UI>
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Start CaseComplete now" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+  </Package>
+</Wix>
