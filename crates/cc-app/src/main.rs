@@ -39,7 +39,7 @@ const TERMINAL_EXES: &[&str] = &["windowsterminal.exe", "conhost.exe", "opencons
 
 enum Msg {
     Key(HookEvent),
-    Token { gen: u64, text: String },
+    Token { gen: u64, text: String, logprob: Option<f32> },
     Done { gen: u64, result: anyhow::Result<Completion> },
 }
 
@@ -67,8 +67,8 @@ fn spawn_engine(client: CompletionClient, out: Sender<Msg>) -> tokio::sync::mpsc
                         let gen = req.gen;
                         let out_tok = out.clone();
                         let result = client
-                            .complete(&req.prompt, N_PREDICT, req.cancel, move |tok| {
-                                let _ = out_tok.send(Msg::Token { gen, text: tok.to_string() });
+                            .complete_with_probs(&req.prompt, N_PREDICT, req.cancel, move |tok, logprob| {
+                                let _ = out_tok.send(Msg::Token { gen, text: tok.to_string(), logprob });
                             })
                             .await;
                         let _ = out.send(Msg::Done { gen, result });
@@ -140,6 +140,13 @@ struct App {
     pending_fix_event: Option<(i64, Instant, usize)>,
     pending_completion_event: Option<i64>,
     completion_latency_ms: u32,
+    /// Raw streamed text of the current completion, before healing strips the partial word.
+    raw: String,
+    /// The half-typed word the prompt was cut before; the completion must start with it.
+    heal: String,
+    tok_count: u32,
+    logprob_sum: f32,
+    min_conf: f32,
     style_lines: Vec<String>,
     style_refreshed: Instant,
     last_tune: Instant,
@@ -260,6 +267,19 @@ impl App {
             return;
         }
         self.cancel_ghost();
+        // Token healing: cut the prompt before a half-typed word so the model completes a
+        // whole word; the stream is then required to start with what was typed.
+        let partial = self.shadow.current_word().to_string();
+        let heal = if partial.chars().all(|c| c.is_alphanumeric() || c == '\'') && !partial.is_empty() {
+            partial
+        } else {
+            String::new()
+        };
+        let ctx = ctx[..ctx.len() - heal.len()].to_string();
+        self.heal = heal;
+        self.raw.clear();
+        self.tok_count = 0;
+        self.logprob_sum = 0.0;
         // Recently accepted sentences in this app give the base model your voice.
         let ctx = if self.style_lines.is_empty() { ctx } else { format!("{}\n\n{}", self.style_lines.join("\n"), ctx) };
         self.gen += 1;
@@ -596,10 +616,14 @@ impl App {
         }
     }
 
-    fn on_token(&mut self, gen: u64, text: String) {
+    fn on_token(&mut self, gen: u64, text: String, logprob: Option<f32>) {
         if gen != self.gen {
             return;
         }
+        if let Some(lp) = logprob {
+            self.logprob_sum += lp;
+        }
+        self.tok_count += 1;
         if !self.first_token_logged {
             self.first_token_logged = true;
             self.completion_latency_ms = self.last_key.elapsed().as_millis() as u32;
@@ -612,13 +636,45 @@ impl App {
             }
         }
         // A newline in a ghost would submit the line in chat fields and terminals.
-        self.ghost.push_str(&text.replace(['\r', '\n'], ""));
-        if self.ghost.trim().is_empty() || degenerate(&self.ghost) {
-            if degenerate(&self.ghost) {
-                self.cancel_ghost();
-            }
+        self.raw.push_str(&text.replace(['\r', '\n'], ""));
+        if degenerate(&self.raw) {
+            self.cancel_ghost();
             return;
         }
+        // Healing: the raw text must reproduce the half-typed word before the ghost begins.
+        let candidate = self.raw.trim_start();
+        let ghost = if self.heal.is_empty() {
+            self.raw.clone()
+        } else if candidate.len() < self.heal.len() {
+            if self.heal.to_lowercase().starts_with(&candidate.to_lowercase()) {
+                return; // still consistent, wait for more
+            }
+            log::debug!("healing mismatch {:?} vs {:?}", candidate, self.heal);
+            self.cancel_ghost();
+            return;
+        } else if candidate.to_lowercase().starts_with(&self.heal.to_lowercase()) {
+            candidate[self.heal.len()..].to_string()
+        } else {
+            log::debug!("healing mismatch {:?} vs {:?}", candidate, self.heal);
+            self.cancel_ghost();
+            return;
+        };
+        if ghost.trim().is_empty() {
+            return;
+        }
+        // Confidence gate on the running mean token probability, judged after a few tokens.
+        if self.tok_count >= 3 {
+            let conf = (self.logprob_sum / self.tok_count as f32).exp();
+            if conf < self.min_conf {
+                log::debug!("low confidence {conf:.2} < {:.2}, hidden: {:?}", self.min_conf, self.raw);
+                self.cancel_ghost();
+                return;
+            }
+        } else if !self.ghost_visible {
+            self.ghost = ghost;
+            return; // not enough evidence yet; keep accumulating silently
+        }
+        self.ghost = ghost;
         self.show_ghost();
     }
 
@@ -635,9 +691,16 @@ impl App {
                     c.prompt_ms,
                     c.predicted_ms
                 );
-                if c.text.trim().is_empty() || degenerate(&c.text) {
+                let conf = c.mean_logprob.map_or(1.0, f32::exp);
+                if c.text.trim().is_empty() || degenerate(&c.text) || conf < self.min_conf {
+                    self.cancel_ghost();
+                } else if self.ghost.trim().is_empty() {
                     self.cancel_ghost();
                 } else {
+                    if !self.ghost_visible {
+                        // Short completions never reached the 3-token gate; show them now.
+                        self.show_ghost();
+                    }
                     let ev = NewEvent {
                         app_exe: self.last_exe.clone(),
                         source: Source::LlmComplete,
@@ -795,7 +858,7 @@ fn run(rx: Receiver<Msg>, mut app: App) {
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(Msg::Key(ev)) => app.on_key(ev),
-            Ok(Msg::Token { gen, text }) => app.on_token(gen, text),
+            Ok(Msg::Token { gen, text, logprob }) => app.on_token(gen, text, logprob),
             Ok(Msg::Done { gen, result }) => app.on_done(gen, result),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -915,6 +978,11 @@ fn main() -> anyhow::Result<()> {
         pending_fix_event: None,
         pending_completion_event: None,
         completion_latency_ms: 0,
+        raw: String::new(),
+        heal: String::new(),
+        tok_count: 0,
+        logprob_sum: 0.0,
+        min_conf: std::env::var("CC_MIN_CONFIDENCE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.12),
         style_lines: Vec::new(),
         style_refreshed: long_ago,
         last_tune: long_ago,

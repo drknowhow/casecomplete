@@ -56,6 +56,18 @@ impl CompletionClient {
         cancel: CancellationToken,
         mut on_token: impl FnMut(&str) + Send,
     ) -> anyhow::Result<Completion> {
+        self.complete_with_probs(prompt, n_predict, cancel, |t, _| on_token(t)).await
+    }
+
+    /// Like [`complete`](Self::complete), but `on_token` also receives the token's log
+    /// probability when the server reports one.
+    pub async fn complete_with_probs(
+        &self,
+        prompt: &str,
+        n_predict: u32,
+        cancel: CancellationToken,
+        mut on_token: impl FnMut(&str, Option<f32>) + Send,
+    ) -> anyhow::Result<Completion> {
         let mut acc = Accumulator::default();
         if cancel.is_cancelled() {
             return Ok(acc.finish());
@@ -282,7 +294,7 @@ struct Accumulator {
 impl Accumulator {
     /// Fold one chunk in. Returns true when the request is finished (final chunk or
     /// sentence end) and the stream should be dropped.
-    fn apply(&mut self, ev: &SseEvent, on_token: &mut dyn FnMut(&str)) -> bool {
+    fn apply(&mut self, ev: &SseEvent, on_token: &mut dyn FnMut(&str, Option<f32>)) -> bool {
         if let Some(ms) = ev.prompt_ms {
             self.prompt_ms = ms;
         }
@@ -295,7 +307,9 @@ impl Accumulator {
         }
         if !ev.content.is_empty() {
             self.text.push_str(&ev.content);
-            on_token(&ev.content);
+            let chunk_logprob = (!ev.logprobs.is_empty())
+                .then(|| (ev.logprobs.iter().sum::<f64>() / ev.logprobs.len() as f64) as f32);
+            on_token(&ev.content, chunk_logprob);
             if ends_sentence(&self.text) {
                 self.sentence_end = true;
                 return true;
@@ -463,7 +477,7 @@ mod tests {
         let mut tokens = Vec::new();
         for l in lines {
             if let Some(e) = parse_sse_line(l).unwrap() {
-                if acc.apply(&e, &mut |t: &str| tokens.push(t.to_string())) {
+                if acc.apply(&e, &mut |t: &str, _: Option<f32>| tokens.push(t.to_string())) {
                     break;
                 }
             }
