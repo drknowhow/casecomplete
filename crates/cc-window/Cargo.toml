@@ -1,0 +1,16 @@
+[package]
+name = "cc-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native WebView2 windows (dashboard + tray flyout) for the CaseComplete local web UI"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+# tao 0.37 is the event-loop/window crate wry 0.57 is developed against
+# (wry's Cargo.toml lists tao 0.37 as its dev-dependency).
+tao = "0.37.1"
+wry = "0.57.0"
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }

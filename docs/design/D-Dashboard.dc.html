@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Insights dashboard</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+body{margin:0}
+a{color:#7FB2F0}a:hover{color:#A9CBF5}
+</style>
+</helmet>
+<div style="width: 1440px; height: 900px; box-sizing: border-box; display: flex; background: #121418; color: #E8E9EB; font-family: 'IBM Plex Sans', system-ui, sans-serif; border-radius: 12px; overflow: hidden; border: 1px solid #2A2D33">
+
+  <nav aria-label="Sections" style="width: 200px; box-sizing: border-box; padding: 22px 14px; background: #0C0E11; border-right: 1px solid #2A2D33; display: flex; flex-direction: column; gap: 4px">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 4px 8px 18px">
+      <span style="display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 7px; background: {{accent}}; color: #FFFFFF; font-family: 'Space Grotesk', sans-serif; font-weight: 600">C</span>
+      <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 15px">CaseComplete</span>
+    </div>
+    <a href="#overview" style="padding: 9px 10px; border-radius: 8px; color: #B6B9BF; text-decoration: none; font-size: 14px">Overview</a>
+    <a href="#insights" style="padding: 9px 10px; border-radius: 8px; background: #1E2127; color: #FFFFFF; text-decoration: none; font-size: 14px; font-weight: 500">Insights</a>
+    <a href="#context" style="padding: 9px 10px; border-radius: 8px; color: #B6B9BF; text-decoration: none; font-size: 14px">Context</a>
+    <a href="#settings" style="padding: 9px 10px; border-radius: 8px; color: #B6B9BF; text-decoration: none; font-size: 14px">Settings</a>
+    <a href="#words" style="padding: 9px 10px; border-radius: 8px; color: #B6B9BF; text-decoration: none; font-size: 14px">Your words</a>
+    <a href="#log" style="padding: 9px 10px; border-radius: 8px; color: #B6B9BF; text-decoration: none; font-size: 14px">Log</a>
+  </nav>
+
+  <main style="flex-grow: 1; min-width: 0; box-sizing: border-box; padding: 22px 26px; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); grid-auto-rows: min-content; gap: 14px; overflow: hidden; align-content: start">
+
+    <div style="grid-column: span 12; display: flex; align-items: baseline; justify-content: space-between">
+      <h1 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-size: 22px; font-weight: 600">Insights <span style="font-size: 13px; font-weight: 400; color: #B6B9BF; margin-left: 10px">30 days · 4,812 events · all local</span></h1>
+      <div style="display: flex; gap: 8px; font-size: 12px; color: #B6B9BF"><span style="padding: 5px 10px; border-radius: 6px; background: #1A1D22">All apps</span><span style="padding: 5px 10px; border-radius: 6px; background: #1A1D22">Export JSONL</span></div>
+    </div>
+
+    <div style="grid-column: span 7; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">Acceptance over time</span><span style="color: #B6B9BF">sentences accepted ÷ shown, per day</span></div>
+      <div style="position: relative; height: 150px">
+        <svg viewBox="0 0 700 150" width="100%" height="150" role="img" aria-label="Acceptance rate rising from 18 percent to 34 percent over 30 days" preserveAspectRatio="none">
+          <line x1="0" y1="112" x2="700" y2="112" stroke="#2A2D33" stroke-width="1"></line>
+          <line x1="0" y1="75" x2="700" y2="75" stroke="#2A2D33" stroke-width="1"></line>
+          <line x1="0" y1="37" x2="700" y2="37" stroke="#2A2D33" stroke-width="1"></line>
+          <path d="M0 120 L24 118 L48 121 L72 112 L96 110 L120 104 L144 108 L168 98 L192 95 L216 99 L240 90 L264 86 L288 92 L312 80 L336 78 L360 82 L384 72 L408 70 L432 74 L456 66 L480 62 L504 66 L528 58 L552 60 L576 54 L600 50 L624 52 L648 46 L672 44 L700 42 L700 150 L0 150 Z" fill="#3A7BD5" opacity="0.14"></path>
+          <path d="M0 120 L24 118 L48 121 L72 112 L96 110 L120 104 L144 108 L168 98 L192 95 L216 99 L240 90 L264 86 L288 92 L312 80 L336 78 L360 82 L384 72 L408 70 L432 74 L456 66 L480 62 L504 66 L528 58 L552 60 L576 54 L600 50 L624 52 L648 46 L672 44 L700 42" fill="none" stroke="#3A7BD5" stroke-width="2.5"></path>
+          <circle cx="700" cy="42" r="4" fill="#3A7BD5"></circle>
+        </svg>
+        <span style="position: absolute; right: 0; top: 10px; font-size: 12px; font-weight: 600; background: #0C0E11; padding: 2px 6px; border-radius: 4px">34%</span>
+        <span style="position: absolute; left: 0; top: 108px; font-size: 11px; color: #B6B9BF">18%</span>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 11px; color: #B6B9BF"><span>Sep 15</span><span>Sep 25</span><span>Oct 5</span><span>Oct 14</span></div>
+    </div>
+
+    <div style="grid-column: span 5; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">Keystroke to ghost</span><span style="color: #B6B9BF">p50 118 · p95 171 ms</span></div>
+      <div style="display: flex; align-items: flex-end; gap: 4px; height: 120px">
+        <span style="flex: 1; height: 6%; background: #2A2D33; border-radius: 2px"></span>
+        <span style="flex: 1; height: 18%; background: #2A2D33; border-radius: 2px"></span>
+        <span style="flex: 1; height: 52%; background: {{accent}}; border-radius: 2px"></span>
+        <span style="flex: 1; height: 100%; background: {{accent}}; border-radius: 2px"></span>
+        <span style="flex: 1; height: 74%; background: {{accent}}; border-radius: 2px"></span>
+        <span style="flex: 1; height: 40%; background: {{accent}}; border-radius: 2px"></span>
+        <span style="flex: 1; height: 22%; background: #2A2D33; border-radius: 2px"></span>
+        <span style="flex: 1; height: 12%; background: #2A2D33; border-radius: 2px"></span>
+        <span style="flex: 1; height: 7%; background: #2A2D33; border-radius: 2px"></span>
+        <span style="flex: 1; height: 4%; background: #2A2D33; border-radius: 2px"></span>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 11px; color: #B6B9BF"><span>60 ms</span><span>120</span><span>180</span><span>240+</span></div>
+    </div>
+
+    <div style="grid-column: span 5; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">By app</span><span style="color: #B6B9BF">fixes kept · sentences accepted</span></div>
+      <div style="display: grid; grid-template-columns: 120px minmax(0, 1fr) 44px; gap: 8px 10px; font-size: 13px; align-items: center">
+        <span>Claude Code</span><span style="height: 10px; background: #2A2D33; border-radius: 5px; position: relative"><span style="position: absolute; left: 0; top: 0; height: 10px; width: 82%; background: {{accent}}; border-radius: 5px"></span></span><span style="text-align: right; color: #B6B9BF">1,204</span>
+        <span>Gmail</span><span style="height: 10px; background: #2A2D33; border-radius: 5px; position: relative"><span style="position: absolute; left: 0; top: 0; height: 10px; width: 56%; background: {{accent}}; border-radius: 5px"></span></span><span style="text-align: right; color: #B6B9BF">822</span>
+        <span>Slack</span><span style="height: 10px; background: #2A2D33; border-radius: 5px; position: relative"><span style="position: absolute; left: 0; top: 0; height: 10px; width: 34%; background: {{accent}}; border-radius: 5px"></span></span><span style="text-align: right; color: #B6B9BF">499</span>
+        <span>Outlook</span><span style="height: 10px; background: #2A2D33; border-radius: 5px; position: relative"><span style="position: absolute; left: 0; top: 0; height: 10px; width: 21%; background: {{accent}}; border-radius: 5px"></span></span><span style="text-align: right; color: #B6B9BF">308</span>
+        <span>Notepad</span><span style="height: 10px; background: #2A2D33; border-radius: 5px; position: relative"><span style="position: absolute; left: 0; top: 0; height: 10px; width: 9%; background: #F0A35E; border-radius: 5px"></span></span><span style="text-align: right; color: #F0A35E">131</span>
+      </div>
+      <span style="font-size: 12px; color: #B6B9BF">Orange: an app where fixes get undone more than 25% of the time.</span>
+    </div>
+
+    <div style="grid-column: span 4; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">What it learned</span><span style="color: #B6B9BF">this month</span></div>
+      <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px">
+        <div style="display: flex; justify-content: space-between"><span>Autocorrect pairs learned</span><span style="font-family: 'IBM Plex Mono', monospace">27</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Words added to dictionary</span><span style="font-family: 'IBM Plex Mono', monospace">9</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Rules demoted</span><span style="font-family: 'IBM Plex Mono', monospace">1</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Confidence floor moved</span><span style="font-family: 'IBM Plex Mono', monospace">0.15 → 0.12</span></div>
+      </div>
+      <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px">
+        <span style="font-size: 12px; background: #0C0E11; border-radius: 6px; padding: 3px 8px">dimitr → Dimitri</span>
+        <span style="font-size: 12px; background: #0C0E11; border-radius: 6px; padding: 3px 8px">taht → that</span>
+        <span style="font-size: 12px; background: #0C0E11; border-radius: 6px; padding: 3px 8px">yepgent ✓</span>
+        <span style="font-size: 12px; background: #0C0E11; border-radius: 6px; padding: 3px 8px">+24 more</span>
+      </div>
+    </div>
+
+    <div style="grid-column: span 3; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">Privacy gate</span><span style="color: #B6B9BF">30 days</span></div>
+      <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px">
+        <div style="display: flex; justify-content: space-between"><span>Sentences never sent</span><span style="font-family: 'IBM Plex Mono', monospace">38</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Card numbers</span><span style="font-family: 'IBM Plex Mono', monospace">3</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Long numbers</span><span style="font-family: 'IBM Plex Mono', monospace">29</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Labelled secrets</span><span style="font-family: 'IBM Plex Mono', monospace">6</span></div>
+        <div style="display: flex; justify-content: space-between"><span>Apps kept off</span><span style="font-family: 'IBM Plex Mono', monospace">5</span></div>
+      </div>
+      <span style="font-size: 12px; color: #3DBF7A; margin-top: auto">Nothing left this machine.</span>
+    </div>
+
+    <div style="grid-column: span 7; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">Context: what the model saw for the last suggestion</span><span style="color: #B6B9BF">Claude Code · 17:06:41 · 131 ms</span></div>
+      <div style="display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 12px">
+        <div style="background: #0C0E11; border-radius: 8px; padding: 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.6; color: #B6B9BF">
+          <div style="color: #6E737B">style prefix (2 of your accepted sentences)</div>
+          <div>I have been stuck on it for a while now.</div>
+          <div>Thanks for the quick turnaround on this.</div>
+          <div style="color: #6E737B; margin-top: 6px">typed text (last 800 chars, trailing space trimmed)</div>
+          <div>…want us to also add a setting that keeps the</div>
+          <div style="color: #E8E9EB; margin-top: 6px">→ <span style="color: #7FB2F0">app running after a reboot.</span> <span style="color: #6E737B">conf 0.34 · 7 tokens · shown · ignored</span></div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: #B6B9BF">
+          <div style="display: flex; justify-content: space-between"><span>Source</span><span style="color: #E8E9EB">shadow buffer</span></div>
+          <div style="display: flex; justify-content: space-between"><span>Healing</span><span style="color: #E8E9EB">off (after space)</span></div>
+          <div style="display: flex; justify-content: space-between"><span>Prefix cache</span><span style="color: #E8E9EB">hit · 6 ms</span></div>
+          <div style="display: flex; justify-content: space-between"><span>Gate</span><span style="color: #E8E9EB">passed 0.12</span></div>
+          <div style="display: flex; justify-content: space-between"><span>Privacy</span><span style="color: #3DBF7A">clean</span></div>
+          <div style="margin-top: auto; display: flex; gap: 6px"><span style="padding: 5px 8px; border-radius: 6px; background: #2A2D33; color: #E8E9EB">Replay</span><span style="padding: 5px 8px; border-radius: 6px; background: #2A2D33; color: #E8E9EB">Mark as bad</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="grid-column: span 5; background: #1A1D22; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+      <div style="display: flex; justify-content: space-between; font-size: 13px"><span style="font-weight: 500">Settings</span><a href="#settings" style="text-decoration: none; font-size: 12px">all settings</a></div>
+      <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; font-size: 13px">
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Model</span><span>Gemma 3 1B · Google</span></div>
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Auto-fix</span><span>Typos + grammar (S1)</span></div>
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Confidence floor</span><span>0.12 · auto-tuned</span></div>
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Accept key</span><span>Tab sentence · Ctrl Tab word</span></div>
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Revert</span><span>Left arrow within 3 s</span></div>
+        <div style="background: #0C0E11; border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 2px"><span style="color: #B6B9BF; font-size: 11px">Start with Windows</span><span style="color: #3DBF7A">On</span></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#3A7BD5","options":["#3A7BD5","#2E8B57","#D97757","#7C6CF0"]},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#3A7BD5' };
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+[package]
+name = "cc-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local web UI (flyout + dashboard) for the CaseComplete typing assistant"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+cc-store = { path = "../cc-store" }
+tiny_http = "0.12"
+getrandom = "0.3"
+
+[dev-dependencies]
+# The demo example backdates events, which the Store API deliberately does not allow.
+rusqlite = { version = "0.40.2", features = ["bundled"] }

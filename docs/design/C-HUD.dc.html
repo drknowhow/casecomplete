@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Option C: caret HUD and command palette</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+body{margin:0}
+a{color:#3A7BD5}a:hover{color:#2A5FA8}
+</style>
+</helmet>
+<div style="width: 1000px; height: 600px; box-sizing: border-box; background: #F7F7F5; color: #17191C; font-family: 'IBM Plex Sans', system-ui, sans-serif; position: relative; overflow: hidden; border-radius: 12px; border: 1px solid #DCDDD9">
+
+  <div style="position: absolute; left: 0; top: 0; right: 0; height: 36px; background: #ECECE9; border-bottom: 1px solid #DCDDD9; display: flex; align-items: center; padding: 0 14px; gap: 8px; font-size: 12px; color: #5B6068">
+    <span style="display: inline-block; width: 10px; height: 10px; border-radius: 5px; background: #DCDDD9"></span>
+    <span style="display: inline-block; width: 10px; height: 10px; border-radius: 5px; background: #DCDDD9"></span>
+    <span style="display: inline-block; width: 10px; height: 10px; border-radius: 5px; background: #DCDDD9"></span>
+    <span style="margin-left: 10px">Windows Terminal · claude</span>
+  </div>
+
+  <div style="position: absolute; left: 0; top: 36px; right: 0; bottom: 0; background: #0C0E11; color: #D7DAE0; font-family: 'IBM Plex Mono', monospace; font-size: 14px; line-height: 1.7; padding: 22px 26px; box-sizing: border-box">
+    <div style="color: #7C8089">› Build the autostart task and an installer for this app.</div>
+    <div style="color: #7C8089">  Reading crates/cc-app/src/main.rs …</div>
+    <div style="margin-top: 18px; display: flex; align-items: center">
+      <span style="color: #7C8089; margin-right: 10px">&gt;</span>
+      <span>I want us to also add a setting that keeps the</span><span style="color: #6E737B"> app running after a reboot.</span><span style="display: inline-block; width: 8px; height: 17px; background: #D7DAE0; margin-left: 2px; vertical-align: text-bottom"></span>
+    </div>
+  </div>
+
+  <div style="position: absolute; left: 288px; top: 112px; display: inline-flex; align-items: center; gap: 8px; background: rgba(23,25,28,0.92); color: #FFFFFF; border-radius: 999px; padding: 5px 10px 5px 8px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.3)">
+    <span style="display: inline-block; width: 8px; height: 8px; border-radius: 4px; background: {{accent}}"></span>
+    <span style="font-family: 'IBM Plex Mono', monospace">0.34</span>
+    <span style="color: #9A9DA3">·</span>
+    <span>Gemma</span>
+    <span style="color: #9A9DA3">·</span>
+    <kbd style="font-family: inherit; background: #3A3D44; border-radius: 4px; padding: 0 6px">Tab</kbd>
+  </div>
+
+  <div style="position: absolute; left: 50%; top: 150px; width: 520px; margin-left: -260px; background: #FFFFFF; border-radius: 14px; box-shadow: 0 24px 60px rgba(0,0,0,0.35); overflow: hidden; border: 1px solid #DCDDD9">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid #ECECE9">
+      <span style="color: #5B6068; font-size: 16px">⌕</span>
+      <label for="cmd" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Command</label>
+      <input id="cmd" value="pau" style="flex-grow: 1; border: 0; outline: 0; font: inherit; font-size: 16px; color: #17191C; background: transparent">
+      <span style="font-size: 11px; color: #5B6068; background: #ECECE9; border-radius: 5px; padding: 2px 7px">Ctrl Alt Space</span>
+    </div>
+    <div style="display: flex; flex-direction: column; padding: 6px">
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; background: #EEF4FD; font-size: 14px"><span><span style="font-weight: 600">Pau</span>se for 10 minutes</span><span style="font-size: 12px; color: #5B6068">here and everywhere</span></div>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; font-size: 14px"><span><span style="font-weight: 600">Pau</span>se in Windows Terminal</span><span style="font-size: 12px; color: #5B6068">remembers this app</span></div>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; font-size: 14px; color: #5B6068"><span>Undo last fix</span><span style="font-size: 12px">thhe → the</span></div>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; font-size: 14px; color: #5B6068"><span>Add "Tselenchuk" to dictionary</span><span style="font-size: 12px">word at caret</span></div>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; font-size: 14px; color: #5B6068"><span>Switch model</span><span style="font-size: 12px">Gemma 3 1B ›</span></div>
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 9px; font-size: 14px; color: #5B6068"><span>Open log and insights</span><span style="font-size: 12px">42 fixes today</span></div>
+    </div>
+  </div>
+
+  <div style="position: absolute; left: 26px; bottom: 18px; display: flex; gap: 18px; font-size: 12px; color: #7C8089; font-family: 'IBM Plex Sans', system-ui, sans-serif">
+    <span>Pill follows the caret and only appears while a suggestion is live</span>
+    <span>·</span>
+    <span>Palette is the whole UI; no tray menu, no settings window</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#3DBF7A","options":["#3DBF7A","#3A7BD5","#D97757"]},"$preview":{"width":1000,"height":600}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#3DBF7A' };
+  }
+}
+</script>
+</body>
+</html>

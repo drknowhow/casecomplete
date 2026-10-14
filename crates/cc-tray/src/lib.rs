@@ -9,6 +9,11 @@
 //! and the thread is woken with `PostThreadMessageW` (the loop also wakes
 //! every 100 ms as a fallback).
 //!
+//! A left click on the icon itself does not open the menu (that stays on the
+//! right button); it is reported as [`TrayEvent::IconClick`] so the app can
+//! toggle a flyout window. Windows delivers a down and an up event per click;
+//! only the up event is forwarded, so one click yields exactly one event.
+//!
 //! Note: `MenuEvent::receiver()` and `TrayIconEvent::receiver()` are
 //! process-global channels. This crate drains both on its own thread and
 //! only forwards events for its own menu items, so it assumes it is the
@@ -22,7 +27,7 @@ use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use tray_icon::menu::{
     CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -41,8 +46,12 @@ pub enum TrayEvent {
     AutoFixLevel(String),
     /// Model chosen in the "Model" submenu; carries the model id, e.g. `"gemma-3-1b-pt"`.
     Model(String),
+    /// "Open dashboard" menu item.
+    OpenDashboard,
     OpenProfileFolder,
     ShowMetrics,
+    /// Left click (button released) on the tray icon itself, not on a menu item.
+    IconClick,
     Quit,
 }
 
@@ -67,6 +76,7 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 const ID_STATUS: &str = "cc-tray.status";
+const ID_OPEN_DASHBOARD: &str = "cc-tray.open_dashboard";
 const ID_ENABLED: &str = "cc-tray.enabled";
 const ID_PAUSE_10: &str = "cc-tray.pause10";
 const ID_PAUSE_60: &str = "cc-tray.pause60";
@@ -239,6 +249,7 @@ impl Ui {
         });
 
         let status = MenuItem::with_id(ID_STATUS, status_text(&initial.status_line), false, None);
+        let open_dashboard = MenuItem::with_id(ID_OPEN_DASHBOARD, "Open dashboard", true, None);
         let enabled = CheckMenuItem::with_id(ID_ENABLED, "Enabled", true, initial.enabled, None);
         let pause10 = MenuItem::with_id(ID_PAUSE_10, "Pause 10 min", true, None);
         let pause60 = MenuItem::with_id(ID_PAUSE_60, "Pause 60 min", true, None);
@@ -268,13 +279,26 @@ impl Ui {
         let sep3 = PredefinedMenuItem::separator();
 
         let menu = Menu::with_items(&[
-            &status, &sep1, &enabled, &pause10, &pause60, &autofix, &model_menu, &sep2, &profile,
-            &metrics, &sep3, &quit,
+            &status,
+            &open_dashboard,
+            &sep1,
+            &enabled,
+            &pause10,
+            &pause60,
+            &autofix,
+            &model_menu,
+            &sep2,
+            &profile,
+            &metrics,
+            &sep3,
+            &quit,
         ])
         .context("failed to build the tray menu")?;
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu.clone()))
+            // Left click is reported as `TrayEvent::IconClick`; the menu stays on the right button.
+            .with_menu_on_left_click(false)
             .with_icon(make_icon()?)
             .with_tooltip(tooltip_for(&initial.status_line))
             .build()
@@ -317,9 +341,16 @@ impl Ui {
                     }
                 }
             }
-            // Click / hover events on the icon itself are not used, but the
-            // global channel is unbounded, so keep it empty.
-            while TrayIconEvent::receiver().try_recv().is_ok() {}
+            // Click / hover events on the icon itself: forward left clicks and
+            // drain the rest (the global channel is unbounded).
+            while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+                if let Some(out) = icon_click_event(&event) {
+                    log::debug!("cc-tray: {out:?}");
+                    if events_tx.send(out).is_err() {
+                        return; // nobody is listening any more
+                    }
+                }
+            }
 
             loop {
                 match cmd_rx.try_recv() {
@@ -339,6 +370,7 @@ impl Ui {
         match id {
             // muda has already flipped the check mark when the event is sent.
             ID_ENABLED => Some(TrayEvent::Enabled(self.enabled.is_checked())),
+            ID_OPEN_DASHBOARD => Some(TrayEvent::OpenDashboard),
             ID_PAUSE_10 => Some(TrayEvent::PauseMinutes(10)),
             ID_PAUSE_60 => Some(TrayEvent::PauseMinutes(60)),
             ID_PROFILE => Some(TrayEvent::OpenProfileFolder),
@@ -399,6 +431,22 @@ impl Ui {
         if !state.status_line.is_empty() {
             self.apply_status(&state.status_line);
         }
+    }
+}
+
+/// A left-button *release* on the tray icon becomes [`TrayEvent::IconClick`].
+///
+/// Windows reports a click as a button-down and a button-up event; taking only
+/// the up half makes one physical click produce one event. Other buttons,
+/// double-click notifications and hover events are ignored.
+fn icon_click_event(event: &TrayIconEvent) -> Option<TrayEvent> {
+    match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } => Some(TrayEvent::IconClick),
+        _ => None,
     }
 }
 
@@ -547,6 +595,74 @@ mod tests {
         let started = std::time::Instant::now();
         drop(tray);
         assert!(started.elapsed() < Duration::from_secs(1), "drop joins the thread promptly");
+    }
+
+    fn click(button: MouseButton, button_state: MouseButtonState) -> TrayIconEvent {
+        TrayIconEvent::Click {
+            id: tray_icon::TrayIconId::new("test"),
+            position: tray_icon::dpi::PhysicalPosition::new(10.0, 20.0),
+            rect: tray_icon::Rect::default(),
+            button,
+            button_state,
+        }
+    }
+
+    #[test]
+    fn left_button_release_is_one_icon_click() {
+        // A physical left click arrives as Down then Up; only Up counts.
+        let down = click(MouseButton::Left, MouseButtonState::Down);
+        let up = click(MouseButton::Left, MouseButtonState::Up);
+        let emitted = [down, up].iter().filter_map(icon_click_event).count();
+        assert_eq!(emitted, 1);
+        assert_eq!(
+            icon_click_event(&click(MouseButton::Left, MouseButtonState::Up)),
+            Some(TrayEvent::IconClick)
+        );
+    }
+
+    #[test]
+    fn other_icon_events_are_ignored() {
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            for state in [MouseButtonState::Down, MouseButtonState::Up] {
+                assert_eq!(icon_click_event(&click(button, state)), None);
+            }
+        }
+        let id = tray_icon::TrayIconId::new("test");
+        let position = tray_icon::dpi::PhysicalPosition::new(0.0, 0.0);
+        let rect = tray_icon::Rect::default();
+        let double = TrayIconEvent::DoubleClick {
+            id: id.clone(),
+            position,
+            rect,
+            button: MouseButton::Left,
+        };
+        let enter = TrayIconEvent::Enter { id: id.clone(), position, rect };
+        let moved = TrayIconEvent::Move { id: id.clone(), position, rect };
+        let leave = TrayIconEvent::Leave { id, position, rect };
+        for event in [double, enter, moved, leave] {
+            assert_eq!(icon_click_event(&event), None);
+        }
+    }
+
+    #[test]
+    fn menu_ids_are_unique() {
+        let mut ids = vec![
+            ID_STATUS,
+            ID_OPEN_DASHBOARD,
+            ID_ENABLED,
+            ID_PAUSE_10,
+            ID_PAUSE_60,
+            ID_PROFILE,
+            ID_METRICS,
+            ID_QUIT,
+        ];
+        ids.extend(LEVELS.iter().map(|(id, _, _)| *id));
+        ids.extend(MODELS.iter().map(|(id, _, _)| *id));
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "every menu item needs its own id");
+        assert!(ids.iter().all(|id| id.starts_with("cc-tray.")));
     }
 
     #[test]

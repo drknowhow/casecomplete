@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Option A: tray flyout</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+body{margin:0}
+a{color:#3A7BD5}a:hover{color:#2A5FA8}
+</style>
+</helmet>
+<div style="width: 380px; height: 620px; box-sizing: border-box; padding: 18px; background: #F7F7F5; color: #17191C; font-family: 'IBM Plex Sans', system-ui, sans-serif; display: flex; flex-direction: column; gap: 14px; border-radius: 14px; border: 1px solid #DCDDD9; box-shadow: 0 18px 50px rgba(0,0,0,0.16)">
+
+  <div style="display: flex; align-items: center; gap: 10px">
+    <span style="display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 8px; background: {{accent}}; color: #FFFFFF; font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px">C</span>
+    <div style="display: flex; flex-direction: column; flex-grow: 1">
+      <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 16px">CaseComplete</span>
+      <span style="font-size: 12px; color: #5B6068; display: inline-flex; align-items: center; gap: 6px"><span style="display: inline-block; width: 7px; height: 7px; border-radius: 4px; background: #2E8B57"></span>Ready · Gemma 3 1B · 118 ms</span>
+    </div>
+    <button aria-label="Enabled" style="width: 46px; height: 26px; border-radius: 13px; border: 0; background: {{accent}}; position: relative; cursor: pointer; padding: 0"><span style="position: absolute; top: 3px; left: 23px; width: 20px; height: 20px; border-radius: 10px; background: #FFFFFF"></span></button>
+  </div>
+
+  <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px">
+    <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 2px">
+      <span style="font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 600">42</span>
+      <span style="font-size: 12px; color: #5B6068">fixes kept</span>
+    </div>
+    <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 2px">
+      <span style="font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 600">7</span>
+      <span style="font-size: 12px; color: #5B6068">sentences</span>
+    </div>
+    <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 2px">
+      <span style="font-family: 'Space Grotesk', sans-serif; font-size: 24px; font-weight: 600">318</span>
+      <span style="font-size: 12px; color: #5B6068">chars saved</span>
+    </div>
+  </div>
+
+  <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px">
+    <div style="display: flex; justify-content: space-between; font-size: 12px; color: #5B6068"><span>Accepted suggestions, last 7 days</span><span>31%</span></div>
+    <div style="display: flex; align-items: flex-end; gap: 6px; height: 44px">
+      <span style="flex: 1; height: 30%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 42%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 38%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 55%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 50%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 68%; background: #DCDDD9; border-radius: 3px"></span>
+      <span style="flex: 1; height: 80%; background: {{accent}}; border-radius: 3px"></span>
+    </div>
+  </div>
+
+  <div style="display: flex; flex-direction: column; gap: 6px">
+    <span style="font-size: 12px; color: #5B6068">Auto-fix</span>
+    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: #ECECE9; border-radius: 9px; padding: 3px; gap: 3px">
+      <button style="border: 0; background: transparent; border-radius: 7px; padding: 7px 0; font: inherit; font-size: 13px; color: #5B6068; cursor: pointer">Off</button>
+      <button style="border: 0; background: transparent; border-radius: 7px; padding: 7px 0; font: inherit; font-size: 13px; color: #5B6068; cursor: pointer">Typos</button>
+      <button style="border: 0; background: #FFFFFF; border-radius: 7px; padding: 7px 0; font: inherit; font-size: 13px; font-weight: 600; color: #17191C; box-shadow: 0 1px 3px rgba(0,0,0,0.12); cursor: pointer">Grammar</button>
+      <button style="border: 0; background: transparent; border-radius: 7px; padding: 7px 0; font: inherit; font-size: 13px; color: #5B6068; cursor: pointer">Bold</button>
+    </div>
+  </div>
+
+  <div style="display: flex; flex-direction: column; background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px">
+    <a href="#model" style="display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; text-decoration: none; color: #17191C; font-size: 14px; border-bottom: 1px solid #ECECE9"><span>Model</span><span style="color: #5B6068">Gemma 3 1B ›</span></a>
+    <a href="#privacy" style="display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; text-decoration: none; color: #17191C; font-size: 14px; border-bottom: 1px solid #ECECE9"><span>Privacy</span><span style="color: #5B6068">Off in 3 apps ›</span></a>
+    <a href="#words" style="display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; text-decoration: none; color: #17191C; font-size: 14px"><span>Your words</span><span style="color: #5B6068">12 learned ›</span></a>
+  </div>
+
+  <div style="margin-top: auto; display: flex; justify-content: space-between; align-items: center; font-size: 13px">
+    <button style="border: 1px solid #DCDDD9; background: #FFFFFF; border-radius: 8px; padding: 8px 12px; font: inherit; font-size: 13px; cursor: pointer">Pause 10 min</button>
+    <div style="display: flex; gap: 14px"><a href="#log" style="text-decoration: none">Log</a><a href="#quit" style="text-decoration: none; color: #5B6068">Quit</a></div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#3A7BD5","options":["#3A7BD5","#2E8B57","#D97757","#17191C"]},"$preview":{"width":380,"height":620}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { accent: this.props.accent ?? '#3A7BD5' };
+  }
+}
+</script>
+</body>
+</html>

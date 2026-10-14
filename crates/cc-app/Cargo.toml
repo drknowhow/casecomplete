@@ -23,5 +23,9 @@ cc-inject = { path = "../cc-inject" }
 cc-correct = { path = "../cc-correct" }
 cc-store = { path = "../cc-store" }
 cc-tray = { path = "../cc-tray" }
+cc-ui = { path = "../cc-ui" }
+cc-window = { path = "../cc-window" }
+winreg = "0.55"
+windows = { workspace = true, features = ["Win32_System_Console"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>In-text overlay treatments</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+body{margin:0}
+a{color:#3A7BD5}a:hover{color:#2A5FA8}
+</style>
+</helmet>
+<div style="width: 1240px; height: 520px; box-sizing: border-box; padding: 40px 48px; background: #F7F7F5; color: #17191C; font-family: 'IBM Plex Sans', system-ui, sans-serif; display: flex; flex-direction: column; gap: 28px">
+  <div style="display: flex; align-items: baseline; justify-content: space-between">
+    <h1 style="margin: 0; font-family: 'Space Grotesk', sans-serif; font-size: 26px; font-weight: 600">What you see while typing</h1>
+    <span style="font-size: 14px; color: #5B6068">Same engine, three treatments. Everything stays inside the field.</span>
+  </div>
+  <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 24px; flex-grow: 1">
+
+    <div style="display: flex; flex-direction: column; gap: 14px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 13px; background: #17191C; color: #FFFFFF; font-size: 13px; font-weight: 600">1</span>
+        <span style="font-weight: 600; font-size: 15px">Ghost only</span>
+        <span style="font-size: 13px; color: #5B6068">today's behaviour, polished</span>
+      </div>
+      <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 18px 20px; font-size: 17px; line-height: 1.6; height: 230px; box-sizing: border-box">
+        <div style="color: #5B6068; font-size: 12px; margin-bottom: 8px">To: Thu · Re: weekend</div>
+        <span>Thanks so much for your help with the</span><span style="color: {{ghost}}"> following question.</span><span style="display: inline-block; width: 2px; height: 20px; background: #17191C; vertical-align: text-bottom; margin-left: 1px"></span>
+      </div>
+      <ul style="margin: 0; padding-left: 18px; font-size: 14px; color: #5B6068; line-height: 1.6">
+        <li>Grey continuation in the field's own font</li>
+        <li>No chrome at all; Tab accepts, Esc dismisses</li>
+        <li>Nothing to learn, nothing to look at</li>
+      </ul>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 14px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 13px; background: #17191C; color: #FFFFFF; font-size: 13px; font-weight: 600">2</span>
+        <span style="font-weight: 600; font-size: 15px">Ghost + key hint</span>
+        <span style="font-size: 13px; color: #5B6068">discoverable</span>
+      </div>
+      <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 18px 20px; font-size: 17px; line-height: 1.6; height: 230px; box-sizing: border-box; position: relative">
+        <div style="color: #5B6068; font-size: 12px; margin-bottom: 8px">Slack · #family</div>
+        <span>I have been stuck on it for a</span><span style="color: {{ghost}}"> while now.</span><span style="display: inline-block; width: 2px; height: 20px; background: #17191C; vertical-align: text-bottom; margin-left: 1px"></span>
+        <div style="position: absolute; left: 20px; top: 112px; display: inline-flex; align-items: center; gap: 10px; background: #17191C; color: #FFFFFF; border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.18)">
+          <span style="display: inline-flex; align-items: center; gap: 5px"><kbd style="font-family: inherit; background: #3A3D44; border-radius: 4px; padding: 1px 6px">Tab</kbd> sentence</span>
+          <span style="display: inline-flex; align-items: center; gap: 5px"><kbd style="font-family: inherit; background: #3A3D44; border-radius: 4px; padding: 1px 6px">Ctrl Tab</kbd> word</span>
+          <span style="color: #9A9DA3">0.31</span>
+        </div>
+      </div>
+      <ul style="margin: 0; padding-left: 18px; font-size: 14px; color: #5B6068; line-height: 1.6">
+        <li>Small dark chip appears after 600 ms, fades after 3 uses</li>
+        <li>Confidence shown as a number, hidden once trusted</li>
+        <li>Helps the first week, then gets out of the way</li>
+      </ul>
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 14px">
+      <div style="display: flex; align-items: center; gap: 10px">
+        <span style="display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border-radius: 13px; background: #17191C; color: #FFFFFF; font-size: 13px; font-weight: 600">3</span>
+        <span style="font-weight: 600; font-size: 15px">Fix feedback</span>
+        <span style="font-size: 13px; color: #5B6068">for auto-corrections</span>
+      </div>
+      <div style="background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 10px; padding: 18px 20px; font-size: 17px; line-height: 1.6; height: 230px; box-sizing: border-box; position: relative">
+        <div style="color: #5B6068; font-size: 12px; margin-bottom: 8px">Claude Code · prompt</div>
+        <span>I want us to create </span><span style="text-decoration: underline; text-decoration-color: {{accent}}; text-decoration-thickness: 2px; text-underline-offset: 4px">the</span><span> system that </span><span style="display: inline-block; width: 2px; height: 20px; background: #17191C; vertical-align: text-bottom; margin-left: 1px"></span>
+        <div style="position: absolute; left: 20px; top: 112px; display: inline-flex; align-items: center; gap: 10px; background: #FFFFFF; border: 1px solid #DCDDD9; border-radius: 8px; padding: 6px 10px; font-size: 12px; color: #17191C; box-shadow: 0 6px 18px rgba(0,0,0,0.10)">
+          <span style="color: #5B6068; text-decoration: line-through">thhe</span>
+          <span>the</span>
+          <span style="color: #5B6068">·</span>
+          <span style="display: inline-flex; align-items: center; gap: 5px"><kbd style="font-family: inherit; background: #EFEFEC; border-radius: 4px; padding: 1px 6px">←</kbd> undo</span>
+        </div>
+      </div>
+      <ul style="margin: 0; padding-left: 18px; font-size: 14px; color: #5B6068; line-height: 1.6">
+        <li>Blue underline fades over 1.5 s on the fixed word</li>
+        <li>Optional receipt chip: what changed and how to undo</li>
+        <li>Receipt off by default in terminals</li>
+      </ul>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"ghost":{"editor":"color","default":"#9A9DA3","options":["#9A9DA3","#B5B8BE","#7C8089"]},"accent":{"editor":"color","default":"#3A7BD5","options":["#3A7BD5","#2E8B57","#D97757"]},"$preview":{"width":1240,"height":520}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return { ghost: this.props.ghost ?? '#9A9DA3', accent: this.props.accent ?? '#3A7BD5' };
+  }
+}
+</script>
+</body>
+</html>

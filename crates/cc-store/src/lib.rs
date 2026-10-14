@@ -183,6 +183,94 @@ pub enum Tuning {
     OfferPromotion { rule: String, reason: String },
 }
 
+const DAY_MS: i64 = 86_400_000;
+
+/// Width of one [`Store::latency_histogram`] bucket.
+pub const LATENCY_BUCKET_MS: u32 = 20;
+/// Number of [`Store::latency_histogram`] buckets: 15 of 20 ms (0..300 ms) plus one open
+/// bucket for everything from 300 ms up.
+pub const LATENCY_BUCKETS: usize = 16;
+/// Number of confidence buckets (deciles) in [`Store::by_confidence`].
+pub const CONFIDENCE_BUCKETS: usize = 10;
+
+/// One calendar day of [`Store::daily_series`].
+///
+/// "Shown"/"accepted" count completions; "fixes" count every other source. A fix is
+/// *kept* when its outcome is `kept` (auto-applied, stayed) or `accepted` (a suggested
+/// fix the user took).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayStat {
+    /// `YYYY-MM-DD` in the requested UTC offset.
+    pub date: String,
+    pub shown: u64,
+    pub accepted: u64,
+    pub fixes_kept: u64,
+    pub fixes_reverted: u64,
+    /// Same definition as [`Metrics::chars_saved`].
+    pub chars_saved: u64,
+}
+
+/// Completion latency distribution from [`Store::latency_histogram`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyHistogram {
+    /// [`LATENCY_BUCKETS`] counts; bucket `i < 15` covers `[i*20, i*20+20)` ms, the last one
+    /// is `300 ms and up`.
+    pub counts: Vec<u64>,
+    pub total: u64,
+    /// Nearest-rank percentiles over the same completion events (0 when empty).
+    pub p50_ms: u32,
+    pub p95_ms: u32,
+}
+
+/// Per-app counters from [`Store::by_app`] (exe names compare case-insensitively).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppStat {
+    pub app_exe: String,
+    pub fixes_kept: u64,
+    pub fixes_reverted: u64,
+    /// Completions shown.
+    pub shown: u64,
+    /// Completions accepted.
+    pub accepted: u64,
+}
+
+/// One confidence decile of [`Store::by_confidence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfidenceBucket {
+    /// 0..=9; bucket `b` covers confidence `[b/10, (b+1)/10)` (the last one includes 1.0).
+    pub bucket: u32,
+    pub shown: u64,
+    pub accepted: u64,
+}
+
+/// Which events [`Store::recent_events`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    All,
+    /// Every source except completions.
+    Fix,
+    /// Completions only.
+    Complete,
+}
+
+/// One row of the event log, as read by [`Store::recent_events`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRow {
+    pub id: i64,
+    pub ts: i64,
+    pub app_exe: String,
+    pub source: String,
+    pub rule: String,
+    pub severity: String,
+    pub confidence: f64,
+    pub context_before: Option<String>,
+    pub original: String,
+    pub replacement: String,
+    pub action: String,
+    pub outcome: Option<String>,
+    pub latency_ms: u32,
+}
+
 /// Handle to a profile's `events.db`.
 pub struct Store {
     conn: Connection,
@@ -438,6 +526,218 @@ impl Store {
         let n = stmt.execute(params![now, cutoff])?;
         Ok(n as u64)
     }
+
+    /// Open an existing `events.db` for reading only (no migration, no writes). WAL lets
+    /// this run next to the orchestrator's writer. Every write method fails on the handle.
+    pub fn open_readonly(path: &Path) -> Result<Store> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open {} read-only", path.display()))?;
+        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        conn.execute_batch("PRAGMA query_only=ON;")?;
+        Ok(Store { conn })
+    }
+
+    /// One row per calendar day for the last `days` days (1..=3660), oldest first, today
+    /// last; days without events are all zeros. Day boundaries are midnight at
+    /// `utc_offset_min` minutes east of UTC (so a browser can pass its own zone).
+    pub fn daily_series(&self, days: u32, utc_offset_min: i32) -> Result<Vec<DayStat>> {
+        self.daily_series_at(now_ms(), days, utc_offset_min)
+    }
+
+    fn daily_series_at(&self, now: i64, days: u32, utc_offset_min: i32) -> Result<Vec<DayStat>> {
+        let days = i64::from(days.clamp(1, 3660));
+        let offset = i64::from(utc_offset_min.clamp(-1440, 1440)) * 60_000;
+        let today = (now + offset).div_euclid(DAY_MS);
+        let first = today - (days - 1);
+        let since = first * DAY_MS - offset;
+        let mut out: Vec<DayStat> = (first..=today)
+            .map(|d| {
+                let (y, m, dd) = civil_from_days(d);
+                DayStat {
+                    date: format!("{y:04}-{m:02}-{dd:02}"),
+                    shown: 0,
+                    accepted: 0,
+                    fixes_kept: 0,
+                    fixes_reverted: 0,
+                    chars_saved: 0,
+                }
+            })
+            .collect();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT (ts + ?1) / ?2, \
+               COUNT(CASE WHEN source = 'llm_complete' THEN 1 END), \
+               COUNT(CASE WHEN source = 'llm_complete' AND outcome = 'accepted' THEN 1 END), \
+               COUNT(CASE WHEN source <> 'llm_complete' AND outcome IN ('kept', 'accepted') THEN 1 END), \
+               COUNT(CASE WHEN source <> 'llm_complete' AND outcome = 'reverted' THEN 1 END), \
+               COALESCE(SUM(CASE \
+                 WHEN source = 'llm_complete' AND outcome = 'accepted' THEN length(replacement) \
+                 WHEN source <> 'llm_complete' AND outcome = 'kept' THEN length(original) \
+                 ELSE 0 END), 0) \
+             FROM events WHERE ts >= ?3 GROUP BY 1",
+        )?;
+        let rows = stmt.query_map(params![offset, DAY_MS, since], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                cnt(r.get(1)?),
+                cnt(r.get(2)?),
+                cnt(r.get(3)?),
+                cnt(r.get(4)?),
+                cnt(r.get(5)?),
+            ))
+        })?;
+        for row in rows {
+            let (day, shown, accepted, kept, reverted, saved) = row?;
+            // Events stamped in the future (clock changes) fall outside the window.
+            let Some(slot) = usize::try_from(day - first).ok().and_then(|i| out.get_mut(i)) else {
+                continue;
+            };
+            slot.shown = shown;
+            slot.accepted = accepted;
+            slot.fixes_kept = kept;
+            slot.fixes_reverted = reverted;
+            slot.chars_saved = saved;
+        }
+        Ok(out)
+    }
+
+    /// Distribution of `latency_ms` over completion events since `since_unix_ms`
+    /// (all if `None`), in 20 ms buckets with an open `300+` bucket, plus nearest-rank
+    /// p50/p95.
+    pub fn latency_histogram(&self, since_unix_ms: Option<i64>) -> Result<LatencyHistogram> {
+        let since = since_unix_ms.unwrap_or(i64::MIN);
+        let last = (LATENCY_BUCKETS - 1) as i64;
+        let mut counts = vec![0u64; LATENCY_BUCKETS];
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT MIN(MAX(latency_ms, 0) / ?2, ?3), COUNT(*) FROM events \
+             WHERE source = 'llm_complete' AND ts >= ?1 GROUP BY 1",
+        )?;
+        let rows = stmt.query_map(params![since, i64::from(LATENCY_BUCKET_MS), last], |r| {
+            Ok((r.get::<_, i64>(0)?, cnt(r.get(1)?)))
+        })?;
+        for row in rows {
+            let (bucket, n) = row?;
+            if let Some(slot) = usize::try_from(bucket).ok().and_then(|i| counts.get_mut(i)) {
+                *slot = n;
+            }
+        }
+        let total = counts.iter().sum::<u64>();
+        let (p50_ms, p95_ms) = if total > 0 {
+            (
+                completion_percentile(&self.conn, since, total, 50)?,
+                completion_percentile(&self.conn, since, total, 95)?,
+            )
+        } else {
+            (0, 0)
+        };
+        Ok(LatencyHistogram { counts, total, p50_ms, p95_ms })
+    }
+
+    /// Counters per app since `since_unix_ms` (all if `None`), busiest first (fixes kept
+    /// plus completions accepted, then reverts, then name).
+    pub fn by_app(&self, since_unix_ms: Option<i64>) -> Result<Vec<AppStat>> {
+        let since = since_unix_ms.unwrap_or(i64::MIN);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT MIN(app_exe), \
+               COUNT(CASE WHEN source <> 'llm_complete' AND outcome IN ('kept', 'accepted') THEN 1 END), \
+               COUNT(CASE WHEN source <> 'llm_complete' AND outcome = 'reverted' THEN 1 END), \
+               COUNT(CASE WHEN source = 'llm_complete' THEN 1 END), \
+               COUNT(CASE WHEN source = 'llm_complete' AND outcome = 'accepted' THEN 1 END) \
+             FROM events WHERE ts >= ?1 GROUP BY app_exe COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(AppStat {
+                app_exe: r.get(0)?,
+                fixes_kept: cnt(r.get(1)?),
+                fixes_reverted: cnt(r.get(2)?),
+                shown: cnt(r.get(3)?),
+                accepted: cnt(r.get(4)?),
+            })
+        })?;
+        let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        out.sort_by(|a, b| {
+            (b.fixes_kept + b.accepted)
+                .cmp(&(a.fixes_kept + a.accepted))
+                .then(b.fixes_reverted.cmp(&a.fixes_reverted))
+                .then_with(|| a.app_exe.to_lowercase().cmp(&b.app_exe.to_lowercase()))
+        });
+        Ok(out)
+    }
+
+    /// Completions shown and accepted per confidence decile since `since_unix_ms` (all if
+    /// `None`). Always [`CONFIDENCE_BUCKETS`] rows, lowest confidence first.
+    pub fn by_confidence(&self, since_unix_ms: Option<i64>) -> Result<Vec<ConfidenceBucket>> {
+        let since = since_unix_ms.unwrap_or(i64::MIN);
+        let last = (CONFIDENCE_BUCKETS - 1) as i64;
+        let mut out: Vec<ConfidenceBucket> = (0..CONFIDENCE_BUCKETS as u32)
+            .map(|bucket| ConfidenceBucket { bucket, shown: 0, accepted: 0 })
+            .collect();
+        // The epsilon keeps 0.7 stored as the f32 0.69999999 in the 0.7 decile.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT MIN(CAST(confidence * 10 + 0.0001 AS INTEGER), ?2), COUNT(*), \
+               COUNT(CASE WHEN outcome = 'accepted' THEN 1 END) \
+             FROM events WHERE source = 'llm_complete' AND ts >= ?1 GROUP BY 1",
+        )?;
+        let rows = stmt.query_map(params![since, last], |r| {
+            Ok((r.get::<_, i64>(0)?, cnt(r.get(1)?), cnt(r.get(2)?)))
+        })?;
+        for row in rows {
+            let (bucket, shown, accepted) = row?;
+            if let Some(slot) = usize::try_from(bucket).ok().and_then(|i| out.get_mut(i)) {
+                slot.shown = shown;
+                slot.accepted = accepted;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The newest `limit` events (at most 1000) of `kind`, newest first.
+    pub fn recent_events(&self, limit: usize, kind: EventKind) -> Result<Vec<EventRow>> {
+        let limit = i64::try_from(limit.min(1000)).unwrap_or(1000);
+        let kind = match kind {
+            EventKind::All => 0i64,
+            EventKind::Fix => 1,
+            EventKind::Complete => 2,
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, ts, app_exe, source, rule, severity, confidence, context_before, \
+               original, replacement, action, outcome, latency_ms \
+             FROM events \
+             WHERE ?2 = 0 OR (?2 = 1 AND source <> 'llm_complete') \
+                OR (?2 = 2 AND source = 'llm_complete') \
+             ORDER BY ts DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit, kind], |r| {
+            Ok(EventRow {
+                id: r.get(0)?,
+                ts: r.get(1)?,
+                app_exe: r.get(2)?,
+                source: r.get(3)?,
+                rule: r.get(4)?,
+                severity: r.get(5)?,
+                confidence: r.get(6)?,
+                context_before: r.get(7)?,
+                original: r.get(8)?,
+                replacement: r.get(9)?,
+                action: r.get(10)?,
+                outcome: r.get(11)?,
+                latency_ms: u32::try_from(r.get::<_, i64>(12)?.max(0)).unwrap_or(u32::MAX),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Rules currently capped at "suggest" (see [`Store::tune`]), sorted by name.
+    pub fn demoted_rules(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT rule FROM rule_overrides WHERE max_severity = 'suggest' ORDER BY rule",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -478,6 +778,36 @@ fn percentile(conn: &Connection, since: i64, n: u64, p: u64) -> Result<u32> {
         Err(e) => return Err(e.into()),
     };
     Ok(u32::try_from(v.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Nearest-rank percentile of `latency_ms` among the `n` completion events since `since`.
+fn completion_percentile(conn: &Connection, since: i64, n: u64, p: u64) -> Result<u32> {
+    let rank = (n * p).div_ceil(100).max(1); // 1-based
+    let offset = i64::try_from(rank - 1).unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare_cached(
+        "SELECT latency_ms FROM events WHERE source = 'llm_complete' AND ts >= ?1 \
+         ORDER BY latency_ms LIMIT 1 OFFSET ?2",
+    )?;
+    let v = match stmt.query_row(params![since, offset], |r| r.get::<_, i64>(0)) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+        Err(e) => return Err(e.into()),
+    };
+    Ok(u32::try_from(v.max(0)).unwrap_or(u32::MAX))
+}
+
+/// Proleptic Gregorian (year, month, day) of the day `days` days after 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn now_ms() -> i64 {
@@ -1008,5 +1338,272 @@ mod tests {
         assert_eq!(tail_chars("abc", 2), "bc");
         assert_eq!(tail_chars("aéb", 2), "éb");
         assert_eq!(tail_chars("abc", 0), "");
+    }
+
+    fn event_in(app: &str, source: Source, action: Action, original: &str, replacement: &str) -> NewEvent {
+        NewEvent {
+            app_exe: app.into(),
+            source,
+            rule: if source == Source::LlmComplete { "complete" } else { "spell" }.into(),
+            severity: "S1".into(),
+            confidence: 0.5,
+            context_before: None,
+            original: original.into(),
+            replacement: replacement.into(),
+            action,
+            latency_ms: 10,
+        }
+    }
+
+    /// A completion with the given confidence and latency, logged now.
+    fn complete_with(s: &Store, app: &str, conf: f32, latency_ms: u32, outcome: Option<Outcome>) -> i64 {
+        let mut ev = event_in(app, Source::LlmComplete, Action::Suggested, "", "some text");
+        ev.confidence = conf;
+        ev.latency_ms = latency_ms;
+        let id = s.log(&ev).unwrap();
+        if let Some(o) = outcome {
+            s.set_outcome(id, o).unwrap();
+        }
+        id
+    }
+
+    #[test]
+    fn open_readonly_reads_but_cannot_write() {
+        let dir = TempDir::new();
+        let path = dir.db();
+        let rw = Store::open(&path).unwrap();
+        let id = rw.log(&fix("spell", Action::Auto, "teh", "the")).unwrap();
+        rw.set_outcome(id, Outcome::Kept).unwrap();
+
+        let ro = Store::open_readonly(&path).unwrap();
+        let m = ro.metrics(None).unwrap();
+        assert_eq!((m.events, m.fixes_auto, m.chars_saved), (1, 1, 3));
+        assert!(ro.log(&fix("spell", Action::Auto, "adn", "and")).is_err());
+        assert!(ro.set_outcome(id, Outcome::Reverted).is_err());
+        assert!(ro.expire_pending(0).is_err());
+        // A writer keeps working and the reader sees its later rows.
+        rw.log(&fix("spell", Action::Auto, "adn", "and")).unwrap();
+        assert_eq!(ro.metrics(None).unwrap().events, 2);
+        drop((ro, rw));
+
+        assert!(Store::open_readonly(&dir.0.join("missing.db")).is_err());
+        // Also fine when the writer has closed and the WAL files are gone.
+        assert_eq!(Store::open_readonly(&path).unwrap().metrics(None).unwrap().events, 2);
+    }
+
+    #[test]
+    fn civil_dates_round_trip_known_days() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(100), (1970, 4, 11));
+    }
+
+    #[test]
+    fn daily_series_buckets_by_day_and_offset() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        let hour = 3_600_000;
+        let now = 100 * DAY_MS + 12 * hour; // 1970-04-11 12:00 UTC
+
+        let at = |ev: NewEvent, ts: i64, o: Option<Outcome>| {
+            let id = s.log(&ev).unwrap();
+            set_ts(&s, id, ts);
+            if let Some(o) = o {
+                s.set_outcome(id, o).unwrap();
+            }
+        };
+        let auto = |orig: &str, rep: &str| event_in("a.exe", Source::Harper, Action::Auto, orig, rep);
+        let comp = || event_in("a.exe", Source::LlmComplete, Action::Suggested, "", "hello world");
+
+        at(auto("teh", "the"), 100 * DAY_MS + 10 * hour, Some(Outcome::Kept));
+        at(
+            event_in("a.exe", Source::Harper, Action::Suggested, "wierd", "weird"),
+            100 * DAY_MS + hour,
+            Some(Outcome::Accepted),
+        );
+        at(auto("adn", "and"), 99 * DAY_MS + 23 * hour + hour / 2, Some(Outcome::Reverted));
+        at(comp(), 98 * DAY_MS + 5 * hour, Some(Outcome::Accepted));
+        at(comp(), 98 * DAY_MS + 6 * hour, Some(Outcome::Ignored));
+        at(auto("old", "older"), 90 * DAY_MS, Some(Outcome::Kept)); // before the window
+        at(auto("fut", "future"), 102 * DAY_MS + hour, Some(Outcome::Kept)); // after today
+
+        let utc = s.daily_series_at(now, 3, 0).unwrap();
+        let dates: Vec<_> = utc.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(dates, ["1970-04-09", "1970-04-10", "1970-04-11"]);
+        assert_eq!(
+            utc[0],
+            DayStat {
+                date: "1970-04-09".into(),
+                shown: 2,
+                accepted: 1,
+                fixes_kept: 0,
+                fixes_reverted: 0,
+                chars_saved: 11
+            }
+        );
+        assert_eq!((utc[1].fixes_reverted, utc[1].fixes_kept, utc[1].chars_saved), (1, 0, 0));
+        // Kept auto fix (3 chars of "teh") and an accepted suggestion; only the former saves chars.
+        assert_eq!((utc[2].fixes_kept, utc[2].fixes_reverted, utc[2].chars_saved), (2, 0, 3));
+
+        // UTC+1: the revert at 23:30 UTC on the 10th is 00:30 on the 11th locally.
+        let plus1 = s.daily_series_at(now, 3, 60).unwrap();
+        assert_eq!((plus1[1].fixes_reverted, plus1[2].fixes_reverted), (0, 1));
+        assert_eq!(plus1[2].fixes_kept, 2);
+        // UTC-12: 12:00 UTC is 00:00 on the 11th, so today starts now and holds nothing yet
+        // (the kept fix at 10:00 UTC and the suggestion at 01:00 UTC are on the 10th there).
+        let minus12 = s.daily_series_at(now, 1, -12 * 60).unwrap();
+        assert_eq!(minus12.len(), 1);
+        assert_eq!(minus12[0].date, "1970-04-11");
+        assert_eq!(minus12[0].fixes_kept, 0);
+    }
+
+    #[test]
+    fn daily_series_zero_fills_and_clamps() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        assert_eq!(s.daily_series(0, 0).unwrap().len(), 1);
+        let rows = s.daily_series(30, 0).unwrap();
+        assert_eq!(rows.len(), 30);
+        assert!(rows.iter().all(|d| d.shown + d.accepted + d.fixes_kept + d.fixes_reverted + d.chars_saved == 0));
+        assert!(rows.windows(2).all(|w| w[0].date < w[1].date));
+        assert_eq!(s.daily_series(1_000_000, 0).unwrap().len(), 3660);
+    }
+
+    #[test]
+    fn latency_histogram_buckets_and_percentiles() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        let empty = s.latency_histogram(None).unwrap();
+        assert_eq!((empty.total, empty.p50_ms, empty.p95_ms), (0, 0, 0));
+        assert_eq!(empty.counts.len(), LATENCY_BUCKETS);
+
+        for ms in [5, 19, 20, 45, 100, 299, 300, 900] {
+            complete_with(&s, "a.exe", 0.5, ms, None);
+        }
+        // A fix with a huge latency must not count.
+        let mut slow = fix("spell", Action::Auto, "teh", "the");
+        slow.latency_ms = 5000;
+        s.log(&slow).unwrap();
+        // An old completion is excluded by `since`.
+        let old = complete_with(&s, "a.exe", 0.5, 150, None);
+        set_ts(&s, old, 1_000);
+
+        let h = s.latency_histogram(Some(2_000)).unwrap();
+        let mut want = vec![0u64; LATENCY_BUCKETS];
+        want[0] = 2;
+        want[1] = 1;
+        want[2] = 1;
+        want[5] = 1;
+        want[14] = 1;
+        want[15] = 2;
+        assert_eq!(h.counts, want);
+        assert_eq!((h.total, h.p50_ms, h.p95_ms), (8, 45, 900));
+
+        let all = s.latency_histogram(None).unwrap();
+        assert_eq!(all.total, 9);
+        assert_eq!(all.counts[7], 1);
+    }
+
+    #[test]
+    fn by_app_groups_case_insensitively_and_orders_by_activity() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        let put = |app: &str, o: Outcome| {
+            let id = s
+                .log(&event_in(app, Source::Harper, Action::Auto, "teh", "the"))
+                .unwrap();
+            s.set_outcome(id, o).unwrap();
+        };
+        put("Notepad.exe", Outcome::Kept);
+        put("notepad.exe", Outcome::Kept);
+        put("NOTEPAD.EXE", Outcome::Reverted);
+        complete_with(&s, "notepad.exe", 0.4, 50, Some(Outcome::Accepted));
+        complete_with(&s, "code.exe", 0.4, 50, Some(Outcome::Ignored));
+        complete_with(&s, "code.exe", 0.4, 50, None);
+        let old = complete_with(&s, "slack.exe", 0.4, 50, Some(Outcome::Accepted));
+        set_ts(&s, old, 1_000);
+
+        let apps = s.by_app(Some(2_000)).unwrap();
+        assert_eq!(apps.len(), 2, "{apps:?}");
+        assert_eq!(apps[0].app_exe.to_lowercase(), "notepad.exe");
+        assert_eq!(
+            (apps[0].fixes_kept, apps[0].fixes_reverted, apps[0].shown, apps[0].accepted),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(apps[1].app_exe, "code.exe");
+        assert_eq!((apps[1].fixes_kept, apps[1].shown, apps[1].accepted), (0, 2, 0));
+        assert_eq!(s.by_app(None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn by_confidence_always_returns_ten_deciles() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        let none = s.by_confidence(None).unwrap();
+        assert_eq!(none.len(), CONFIDENCE_BUCKETS);
+        assert!(none.iter().enumerate().all(|(i, b)| b.bucket == i as u32 && b.shown == 0));
+
+        complete_with(&s, "a.exe", 0.0, 10, Some(Outcome::Ignored));
+        complete_with(&s, "a.exe", 0.05, 10, Some(Outcome::Accepted));
+        complete_with(&s, "a.exe", 0.1, 10, None);
+        complete_with(&s, "a.exe", 0.7, 10, Some(Outcome::Accepted)); // f32 0.7 < 0.7 exactly
+        complete_with(&s, "a.exe", 0.99, 10, Some(Outcome::Accepted));
+        complete_with(&s, "a.exe", 1.0, 10, Some(Outcome::Overwritten));
+        // Fixes never count.
+        s.log(&fix("spell", Action::Auto, "teh", "the")).unwrap();
+
+        let b = s.by_confidence(None).unwrap();
+        let shown: Vec<u64> = b.iter().map(|x| x.shown).collect();
+        let accepted: Vec<u64> = b.iter().map(|x| x.accepted).collect();
+        assert_eq!(shown, [2, 1, 0, 0, 0, 0, 0, 1, 0, 2]);
+        assert_eq!(accepted, [1, 0, 0, 0, 0, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn recent_events_newest_first_and_filtered() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        assert!(s.recent_events(10, EventKind::All).unwrap().is_empty());
+
+        let a = s.log(&fix("spell", Action::Auto, "teh", "the")).unwrap();
+        let b = complete_with(&s, "code.exe", 0.4, 77, Some(Outcome::Accepted));
+        let c = s.log(&fix("grammar", Action::Suggested, "wierd", "weird")).unwrap();
+        for (id, ts) in [(a, 1_000), (b, 2_000), (c, 3_000)] {
+            set_ts(&s, id, ts);
+        }
+        s.set_outcome(a, Outcome::Kept).unwrap();
+
+        let all = s.recent_events(10, EventKind::All).unwrap();
+        assert_eq!(all.iter().map(|e| e.id).collect::<Vec<_>>(), [c, b, a]);
+        assert_eq!(s.recent_events(2, EventKind::All).unwrap().len(), 2);
+        assert!(s.recent_events(0, EventKind::All).unwrap().is_empty());
+
+        let fixes = s.recent_events(10, EventKind::Fix).unwrap();
+        assert_eq!(fixes.iter().map(|e| e.id).collect::<Vec<_>>(), [c, a]);
+        assert_eq!(fixes[1].outcome.as_deref(), Some("kept"));
+        assert_eq!((fixes[1].original.as_str(), fixes[1].replacement.as_str()), ("teh", "the"));
+        assert_eq!(fixes[0].outcome, None);
+
+        let comps = s.recent_events(10, EventKind::Complete).unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(comps[0].source, "llm_complete");
+        assert_eq!((comps[0].app_exe.as_str(), comps[0].latency_ms), ("code.exe", 77));
+        assert_eq!(comps[0].outcome.as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn demoted_rules_lists_suggest_overrides() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        assert!(s.demoted_rules().unwrap().is_empty());
+        log_auto(&s, "bad_rule", 25, 8);
+        log_auto(&s, "fine_rule", 25, 0);
+        s.tune().unwrap();
+        assert_eq!(s.demoted_rules().unwrap(), ["bad_rule"]);
+        s.clear_demotion("bad_rule").unwrap();
+        assert!(s.demoted_rules().unwrap().is_empty());
     }
 }

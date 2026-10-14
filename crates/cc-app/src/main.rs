@@ -11,8 +11,12 @@ use std::time::{Duration, Instant};
 
 use std::collections::{HashMap, HashSet};
 
+mod autostart;
 mod privacy;
 use privacy::Policy;
+
+use cc_ui::{ContextSnapshot, ModelInfo, UiCommand, UiServer, UiSettings, UiState};
+use cc_window::Windows;
 
 use anyhow::Context;
 use cc_correct::{AutocorrectList, Checker, PersonalDictionary, Severity};
@@ -97,6 +101,12 @@ struct Settings {
     auto_fix_level: String,
     #[serde(default = "default_model")]
     model: String,
+    #[serde(default = "default_min_confidence")]
+    min_confidence: f32,
+}
+
+fn default_min_confidence() -> f32 {
+    0.12
 }
 
 fn default_model() -> String {
@@ -105,7 +115,7 @@ fn default_model() -> String {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: true, auto_fix_level: "S1".into(), model: default_model() }
+        Settings { enabled: true, auto_fix_level: "S1".into(), model: default_model(), min_confidence: 0.12 }
     }
 }
 
@@ -147,6 +157,12 @@ struct App {
     rt: tokio::runtime::Runtime,
     sidecar: Option<Sidecar>,
     denied_hwnd: isize,
+    ui_state: Arc<UiState>,
+    ui: UiServer,
+    ui_cmds: Receiver<UiCommand>,
+    windows: Windows,
+    /// Tail of the prompt sent for the current completion, for the context panel.
+    last_prompt_tail: String,
     enabled: bool,
     paused_until: Option<Instant>,
     /// Rules the nightly tuning demoted to suggest-only.
@@ -162,6 +178,8 @@ struct App {
     /// The prompt was trimmed of trailing spaces the user already typed, so the completion
     /// must begin with whitespace and the ghost shows it without.
     need_space: bool,
+    last_prompt_ms: f32,
+    last_context_event: Option<i64>,
     tok_count: u32,
     logprob_sum: f32,
     min_conf: f32,
@@ -206,7 +224,9 @@ impl App {
             enabled: self.enabled,
             auto_fix_level: level_name(&self.auto_level),
             model: self.model_id.clone(),
+            min_confidence: self.min_conf,
         };
+        self.push_ui_settings();
         if let Ok(json) = serde_json::to_string_pretty(&s) {
             if let Err(e) = std::fs::write(self.settings_path(), json) {
                 log::warn!("settings save failed: {e}");
@@ -217,6 +237,120 @@ impl App {
     fn outcome(&mut self, id: i64, outcome: Outcome) {
         if let Err(e) = self.store.set_outcome(id, outcome) {
             log::warn!("store outcome failed: {e:#}");
+        }
+        if Some(id) == self.last_context_event {
+            if let Ok(mut c) = self.ui_state.last_context.lock() {
+                if let Some(c) = c.as_mut() {
+                    c.outcome = Some(format!("{outcome:?}").to_lowercase());
+                }
+            }
+        }
+    }
+
+    /// Mirrors the live settings into the web UI's shared state.
+    fn push_ui_settings(&self) {
+        let models = cc_engine::MODELS
+            .iter()
+            .map(|m| ModelInfo {
+                id: m.id.to_string(),
+                label: m.label.to_string(),
+                origin: m.origin.to_string(),
+                installed: cc_engine::model_installed(&self.root, m.id),
+            })
+            .collect();
+        let paused_until_ms = self.paused_until.and_then(|t| {
+            let left = t.checked_duration_since(Instant::now())?;
+            Some(unix_ms() + left.as_millis() as i64)
+        });
+        if let Ok(mut s) = self.ui_state.settings.lock() {
+            let status_line = std::mem::take(&mut s.status_line);
+            *s = UiSettings {
+                enabled: self.enabled,
+                paused_until_ms,
+                auto_fix_level: level_name(&self.auto_level),
+                model: self.model_id.clone(),
+                min_confidence: self.min_conf,
+                models,
+                profile_dir: self.profile.display().to_string(),
+                autostart: autostart::is_enabled(),
+                status_line,
+            };
+        }
+    }
+
+    /// One line per block in the profile's privacy_log.jsonl; only the reason, never the text.
+    fn log_privacy(&self, reason: &str) {
+        use std::io::Write;
+        let line = format!("{{\"ts\":{},\"reason\":{}}}\n", unix_ms(), serde_json::to_string(reason).unwrap_or_default());
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.profile.join("privacy_log.jsonl")) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    fn record_context(&mut self, completion: &str, confidence: f32, privacy_block: Option<String>) {
+        let snap = ContextSnapshot {
+            ts_ms: unix_ms(),
+            app_exe: self.last_exe.clone(),
+            style_lines: self.style_lines.clone(),
+            prompt_tail: self.last_prompt_tail.clone(),
+            heal: self.heal.clone(),
+            need_space: self.need_space,
+            completion: completion.to_string(),
+            confidence,
+            tokens: self.tok_count,
+            latency_ms: self.completion_latency_ms,
+            prompt_ms: self.last_prompt_ms,
+            outcome: None,
+            privacy_block,
+        };
+        if let Ok(mut c) = self.ui_state.last_context.lock() {
+            *c = Some(snap);
+        }
+    }
+
+    fn on_ui_command(&mut self, cmd: UiCommand) {
+        log::info!("ui: {cmd:?}");
+        match cmd {
+            UiCommand::SetEnabled(b) => self.on_tray(TrayEvent::Enabled(b)),
+            UiCommand::PauseMinutes(m) => self.on_tray(TrayEvent::PauseMinutes(m)),
+            UiCommand::SetAutoFixLevel(s) => self.on_tray(TrayEvent::AutoFixLevel(s)),
+            UiCommand::SetModel(id) => self.on_tray(TrayEvent::Model(id)),
+            UiCommand::SetMinConfidence(c) => {
+                self.min_conf = c.clamp(0.0, 1.0);
+                self.save_settings();
+            }
+            UiCommand::AddDictionaryWord(w) => {
+                self.dict.add(&w);
+                let _ = self.dict.save(&self.dict_path);
+            }
+            UiCommand::RemoveDictionaryWord(w) => {
+                self.dict = PersonalDictionary::load(&self.dict_path);
+                let keep: Vec<String> = std::fs::read_to_string(&self.dict_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case(&w))
+                    .map(String::from)
+                    .collect();
+                let _ = std::fs::write(&self.dict_path, keep.join("\n") + "\n");
+                self.dict = PersonalDictionary::load(&self.dict_path);
+            }
+            UiCommand::SetAutocorrect(typo, fix) => {
+                self.auto.add(&typo, &fix);
+                let _ = self.auto.save(&self.auto_path);
+            }
+            UiCommand::RemoveAutocorrect(typo) => {
+                self.auto.remove(&typo);
+                let _ = self.auto.save(&self.auto_path);
+            }
+            UiCommand::SetAutostart(b) => {
+                if let Err(e) = autostart::set(b) {
+                    log::warn!("autostart: {e:#}");
+                }
+                self.push_ui_settings();
+            }
+            UiCommand::OpenProfileFolder => self.on_tray(TrayEvent::OpenProfileFolder),
+            UiCommand::Quit => self.on_tray(TrayEvent::Quit),
         }
     }
 
@@ -266,6 +400,7 @@ impl App {
                     if self.denied_hwnd != fi.hwnd {
                         self.denied_hwnd = fi.hwnd;
                         log::info!("privacy: off here ({why})");
+                        self.log_privacy(&why);
                     }
                     return false;
                 }
@@ -295,6 +430,9 @@ impl App {
         }
         if let Some(why) = privacy::sensitive(&ctx) {
             log::debug!("privacy: no completion ({why})");
+            self.log_privacy(why);
+            self.last_prompt_tail.clear();
+            self.record_context("", 0.0, Some(why.to_string()));
             return;
         }
         self.cancel_ghost();
@@ -318,6 +456,7 @@ impl App {
         self.tok_count = 0;
         self.logprob_sum = 0.0;
         // Recently accepted sentences in this app give the base model your voice.
+        self.last_prompt_tail = ctx.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
         let ctx = if self.style_lines.is_empty() { ctx } else { format!("{}\n\n{}", self.style_lines.join("\n"), ctx) };
         self.gen += 1;
         self.req_started = Some(Instant::now());
@@ -401,7 +540,8 @@ impl App {
         let start = body.rfind(|c| matches!(c, '.' | '!' | '?' | '\n')).map_or(0, |i| i + 1);
         let sentence = body[start..].trim_start().to_string();
         let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("").to_string();
-        if privacy::sensitive(&sentence).is_some() {
+        if let Some(why) = privacy::sensitive(&sentence) {
+            self.log_privacy(why);
             self.prev_boundary = None;
             return;
         }
@@ -762,8 +902,13 @@ impl App {
                         action: Action::Suggested,
                         latency_ms: self.completion_latency_ms,
                     };
+                    self.last_prompt_ms = c.prompt_ms;
+                    self.record_context(&c.text, conf, None);
                     match self.store.log(&ev) {
-                        Ok(id) => self.pending_completion_event = Some(id),
+                        Ok(id) => {
+                            self.pending_completion_event = Some(id);
+                            self.last_context_event = Some(id);
+                        }
                         Err(e) => log::warn!("store log failed: {e:#}"),
                     }
                 }
@@ -801,6 +946,8 @@ impl App {
             }
             TrayEvent::ShowMetrics => self.refresh_status(true),
             TrayEvent::Model(id) => self.switch_model(&id),
+            TrayEvent::IconClick => self.windows.toggle_flyout(&self.ui.url("flyout")),
+            TrayEvent::OpenDashboard => self.windows.open_dashboard(&self.ui.url("dashboard")),
             TrayEvent::Quit => {
                 log::info!("quit from tray");
                 std::process::exit(0);
@@ -886,6 +1033,9 @@ impl App {
                     log::info!("{line}");
                 }
                 self.tray.set_status(&line);
+                if let Ok(mut s) = self.ui_state.settings.lock() {
+                    s.status_line = line;
+                }
             }
             Err(e) => log::warn!("metrics failed: {e:#}"),
         }
@@ -929,6 +1079,9 @@ impl App {
     fn tick(&mut self) {
         while let Ok(ev) = self.tray.events().try_recv() {
             self.on_tray(ev);
+        }
+        while let Ok(cmd) = self.ui_cmds.try_recv() {
+            self.on_ui_command(cmd);
         }
         if let Some((id, at, _)) = self.pending_fix_event {
             if at.elapsed() >= KEPT_AFTER {
@@ -1002,10 +1155,25 @@ fn data_root() -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let root = data_root();
     std::fs::create_dir_all(&root)?;
+    let background = std::env::args().any(|a| a == "--background");
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if background {
+        // Started by autostart: no console, so the log goes to a file and the console
+        // window that Windows gave us is released.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join("casecomplete.log"))
+            .context("open log file")?;
+        logger.target(env_logger::Target::Pipe(Box::new(log)));
+        // SAFETY: plain Win32 call; failure only means there was no console.
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
+    logger.init();
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
@@ -1058,6 +1226,11 @@ fn main() -> anyhow::Result<()> {
     })
     .context("tray icon")?;
     let policy = Policy::load(&profile.join("privacy.toml"));
+    let ui_state = Arc::new(UiState::default());
+    let (ui_tx, ui_cmds) = unbounded::<UiCommand>();
+    let ui = UiServer::start(&profile.join("events.db"), &profile, ui_state.clone(), ui_tx).context("ui server")?;
+    let windows = Windows::new().context("ui windows")?;
+    log::info!("dashboard: {}", ui.url("dashboard"));
     let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
     let mut app = App {
         store,
@@ -1069,6 +1242,11 @@ fn main() -> anyhow::Result<()> {
         rt,
         sidecar: None,
         denied_hwnd: 0,
+        ui_state,
+        ui,
+        ui_cmds,
+        windows,
+        last_prompt_tail: String::new(),
         enabled: settings.enabled,
         paused_until: None,
         demoted: HashSet::new(),
@@ -1078,9 +1256,11 @@ fn main() -> anyhow::Result<()> {
         raw: String::new(),
         heal: String::new(),
         need_space: false,
+        last_prompt_ms: 0.0,
+        last_context_event: None,
         tok_count: 0,
         logprob_sum: 0.0,
-        min_conf: std::env::var("CC_MIN_CONFIDENCE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.12),
+        min_conf: std::env::var("CC_MIN_CONFIDENCE").ok().and_then(|v| v.parse().ok()).unwrap_or(settings.min_confidence),
         style_lines: Vec::new(),
         style_refreshed: long_ago,
         last_tune: long_ago,
@@ -1116,6 +1296,7 @@ fn main() -> anyhow::Result<()> {
     };
     app.start_engine(&model_id).context("engine")?;
     app.run_tuning();
+    app.push_ui_settings();
     app.refresh_status(true);
     log::info!(
         "casecomplete running. Tab accepts, Ctrl+Tab one word, Esc dismisses; auto-fix up to {:?}, Left/Backspace within 3 s reverts.",

@@ -1,5 +1,7 @@
 //! Shows the tray icon for 30 seconds, printing every event.
 //! The status line gets a counter every 5 seconds. Exits early on "Quit".
+//! Left-click the icon to see `IconClick`; right-click it for the menu
+//! (which starts with the status line and "Open dashboard").
 
 use std::time::{Duration, Instant};
 
@@ -44,7 +46,10 @@ fn main() -> anyhow::Result<()> {
                         state.status_line = String::new();
                         tray.set_state(&state);
                     }
-                    TrayEvent::OpenProfileFolder | TrayEvent::ShowMetrics => {}
+                    TrayEvent::OpenDashboard
+                    | TrayEvent::IconClick
+                    | TrayEvent::OpenProfileFolder
+                    | TrayEvent::ShowMetrics => {}
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
