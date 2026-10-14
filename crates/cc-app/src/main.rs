@@ -144,6 +144,9 @@ struct App {
     raw: String,
     /// The half-typed word the prompt was cut before; the completion must start with it.
     heal: String,
+    /// The prompt was trimmed of trailing spaces the user already typed, so the completion
+    /// must begin with whitespace and the ghost shows it without.
+    need_space: bool,
     tok_count: u32,
     logprob_sum: f32,
     min_conf: f32,
@@ -275,7 +278,13 @@ impl App {
         } else {
             String::new()
         };
-        let ctx = ctx[..ctx.len() - heal.len()].to_string();
+        // A prompt that ends in a space makes small base models answer with digits (bench:
+        // top-1 drops from 13% to ~1%), so the prompt always ends at a word and the
+        // completion must supply the space itself.
+        let cut = ctx[..ctx.len() - heal.len()].to_string();
+        let trimmed = cut.trim_end_matches(' ');
+        self.need_space = trimmed.len() < cut.len() && !trimmed.is_empty() && !trimmed.ends_with('\n');
+        let ctx = trimmed.to_string();
         self.heal = heal;
         self.raw.clear();
         self.tok_count = 0;
@@ -641,10 +650,15 @@ impl App {
             self.cancel_ghost();
             return;
         }
+        if self.need_space && !self.raw.is_empty() && !self.raw.starts_with(char::is_whitespace) {
+            log::debug!("continuation glued to the last word, dropped: {:?}", self.raw);
+            self.cancel_ghost();
+            return;
+        }
         // Healing: the raw text must reproduce the half-typed word before the ghost begins.
         let candidate = self.raw.trim_start();
         let ghost = if self.heal.is_empty() {
-            self.raw.clone()
+            if self.need_space { candidate.to_string() } else { self.raw.clone() }
         } else if candidate.len() < self.heal.len() {
             if self.heal.to_lowercase().starts_with(&candidate.to_lowercase()) {
                 return; // still consistent, wait for more
@@ -980,6 +994,7 @@ fn main() -> anyhow::Result<()> {
         completion_latency_ms: 0,
         raw: String::new(),
         heal: String::new(),
+        need_space: false,
         tok_count: 0,
         logprob_sum: 0.0,
         min_conf: std::env::var("CC_MIN_CONFIDENCE").ok().and_then(|v| v.parse().ok()).unwrap_or(0.12),
