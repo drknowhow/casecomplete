@@ -1,0 +1,12 @@
+[package]
+name = "cc-correct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Pinned: harper-core 2.4.0 .. 2.11.0 do not compile on rustc 1.93 (E0308 in
+# `linting/for_free_of_charge.rs`, `naked_eye.rs`, ...: `&[fn items]` passed where
+# `&'static [fn pointer]` is expected). 2.0.0 is the newest release verified to build.
+# `concurrent` makes the lint group `Send + Sync` (Arc instead of Rc); `Checker` needs it.
+harper-core = { version = "=2.0.0", features = ["concurrent"] }
