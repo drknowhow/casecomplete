@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::Context;
+use cc_correct::{Checker, PersonalDictionary, Severity};
 use cc_engine::{Completion, CompletionClient};
 use cc_hook::{HookEvent, ShadowBuffer, SwallowState};
 use cc_overlay::{GhostStyle, Overlay};
@@ -20,13 +23,12 @@ const PORT: u16 = 8089;
 const DEBOUNCE: Duration = Duration::from_millis(100);
 const N_PREDICT: u32 = 24;
 const CONTEXT_CHARS: usize = 800;
-const EXCLUDED_EXES: &[&str] = &[
-    "windowsterminal.exe",
-    "1password.exe",
-    "keepassxc.exe",
-    "casecomplete.exe",
-    "conhost.exe",
-];
+const REVERT_WINDOW_MS: u64 = 3000;
+const UNDERLINE_FADE_MS: u32 = 1500;
+const EXCLUDED_EXES: &[&str] = &["1password.exe", "keepassxc.exe", "casecomplete.exe"];
+/// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
+/// is the only context and editability is assumed.
+const TERMINAL_EXES: &[&str] = &["windowsterminal.exe", "conhost.exe", "openconsole.exe", "wezterm-gui.exe", "alacritty.exe"];
 
 enum Msg {
     Key(HookEvent),
@@ -71,7 +73,24 @@ fn spawn_engine(client: CompletionClient, out: Sender<Msg>) -> tokio::sync::mpsc
     tx
 }
 
+/// The last auto-applied correction, revertable while the hook's revert window is open.
+struct Fix {
+    original: String,
+    replacement: String,
+    boundary: char,
+}
+
 struct App {
+    checker: Checker,
+    dict: PersonalDictionary,
+    dict_path: PathBuf,
+    auto_level: Option<Severity>,
+    last_fix: Option<Fix>,
+    /// Keys the hook swallowed during an injection, replayed once the channel has drained.
+    replay: String,
+    replay_at: Option<Instant>,
+    dont_touch: HashSet<String>,
+    reverts: HashMap<String, u32>,
     shadow: ShadowBuffer,
     ghost: String,
     ghost_visible: bool,
@@ -87,6 +106,7 @@ struct App {
     style: GhostStyle,
     last_exe: String,
     last_hwnd: isize,
+    in_terminal: bool,
 }
 
 impl App {
@@ -104,6 +124,10 @@ impl App {
     fn resync(&mut self) {
         self.cancel_ghost();
         self.pending = false;
+        if self.in_terminal {
+            self.shadow.reset("");
+            return;
+        }
         if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
             self.shadow.reset(&t);
         } else {
@@ -121,7 +145,10 @@ impl App {
                     // A different window means the shadow buffer describes the wrong field.
                     self.shadow.reset("");
                 }
-                !fi.is_password && fi.is_editable && !EXCLUDED_EXES.contains(&fi.exe.as_str())
+                self.in_terminal = TERMINAL_EXES.contains(&fi.exe.as_str());
+                !fi.is_password
+                    && (fi.is_editable || self.in_terminal)
+                    && !EXCLUDED_EXES.contains(&fi.exe.as_str())
             }
             None => false,
         }
@@ -134,9 +161,11 @@ impl App {
         }
         // UIA text is authoritative once it has caught up with what we typed or injected;
         // right after an injection it can still be short, so the shadow buffer wins then.
-        if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
-            if t.len() >= self.shadow.text().len() {
-                self.shadow.reset(&t);
+        if !self.in_terminal {
+            if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
+                if t.len() >= self.shadow.text().len() {
+                    self.shadow.reset(&t);
+                }
             }
         }
         let ctx = self.shadow.text().to_string();
@@ -190,7 +219,9 @@ impl App {
             head
         };
         log::debug!("inject {text:?}");
+        self.swallow.set_capture(true);
         let result = if use_paste() { cc_inject::paste_text(&text) } else { cc_inject::type_text(&text) };
+        self.end_capture();
         if let Err(e) = result {
             log::warn!("inject failed: {e:#}");
         }
@@ -211,12 +242,151 @@ impl App {
         }
     }
 
+    /// Runs after the word before `boundary` is closed. Auto-applies one S0/S1 candidate that
+    /// spans exactly that word; anything else is left alone. Never runs after Enter, because
+    /// in chat fields the text has already been sent.
+    fn on_word_boundary(&mut self, boundary: char) {
+        let Some(level) = self.auto_level.clone() else { return };
+        let text = self.shadow.text();
+        let body = &text[..text.len() - boundary.len_utf8()];
+        let start = body.rfind(|c| matches!(c, '.' | '!' | '?' | '\n')).map_or(0, |i| i + 1);
+        let sentence = body[start..].trim_start();
+        let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("");
+        if word.is_empty() || self.dont_touch.contains(word) || cc_correct::is_code_like(word) {
+            return;
+        }
+        let t0 = Instant::now();
+        let n_chars = sentence.chars().count();
+        let candidate = self
+            .checker
+            .check(sentence, &self.dict)
+            .into_iter()
+            .find(|c| c.end == n_chars && c.severity <= level && sentence.ends_with(&c.original));
+        let Some(c) = candidate else { return };
+        log::info!(
+            "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
+            c.original, c.replacement, c.rule, c.severity, c.confidence, t0.elapsed().as_millis()
+        );
+        self.cancel_ghost();
+        let caret = cc_context::caret_rect();
+        let mut typed = c.replacement.clone();
+        typed.push(boundary);
+        if !self.replace_tail(c.original.chars().count() + 1, &typed) {
+            return;
+        }
+        if let Some(r) = caret {
+            let w = (typed.chars().count() as f32 * self.style.font_px * 0.55) as i32;
+            self.overlay.show_underline(cc_overlay::Rect { x: r.x - w, y: r.y, w, h: r.h }, UNDERLINE_FADE_MS);
+        }
+        self.swallow.set_revert_until(cc_hook::now_ms() + REVERT_WINDOW_MS);
+        self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary });
+    }
+
+    /// Deletes `del` chars before the caret and types `typed`, keeping the shadow in step.
+    fn replace_tail(&mut self, del: usize, typed: &str) -> bool {
+        let gap = Duration::from_millis(fix_key_gap_ms());
+        // Capture the user's keys for the duration, and let the boundary key that triggered
+        // us settle in the target before deleting behind it.
+        self.swallow.set_capture(true);
+        std::thread::sleep(Duration::from_millis(fix_pre_delay_ms()));
+        let result = match fix_inject_mode().as_str() {
+            "fast" => cc_inject::backspace(del).and_then(|_| cc_inject::type_text(typed)),
+            "paste" => cc_inject::backspace_slow(del, gap).and_then(|_| cc_inject::paste_text(typed)),
+            "keys-burst" => cc_inject::backspace(del).and_then(|_| cc_inject::type_text_keys(typed, Duration::ZERO)),
+            "keys-slow" => cc_inject::backspace_slow(del, gap).and_then(|_| cc_inject::type_text_keys(typed, gap)),
+            "slow" => cc_inject::backspace_slow(del, gap).and_then(|_| cc_inject::type_text_slow(typed, gap)),
+            // Default: Notepad drops some of a burst of identical Backspace presses, so space
+            // them out; the replacement itself can go in one burst of real key events.
+            _ => cc_inject::backspace_slow(del, gap).and_then(|_| cc_inject::type_text_keys(typed, Duration::ZERO)),
+        };
+        self.end_capture();
+        if let Err(e) = result {
+            log::warn!("correction inject failed: {e:#}");
+            self.resync();
+            return false;
+        }
+        for _ in 0..del {
+            self.shadow.backspace();
+        }
+        for ch in typed.chars() {
+            self.shadow.push(ch);
+        }
+        self.last_key = Instant::now() + inject_settle(del + typed.chars().count());
+        self.pending = true;
+        true
+    }
+
+    /// Stops capturing; captured keys are replayed on a later tick, once the hook thread has
+    /// delivered all of them.
+    fn end_capture(&mut self) {
+        self.swallow.set_capture(false);
+        self.replay_at = Some(Instant::now() + Duration::from_millis(30));
+    }
+
+    fn flush_replay(&mut self) {
+        if self.replay.is_empty() {
+            return;
+        }
+        let keys = std::mem::take(&mut self.replay);
+        log::debug!("replay {keys:?}");
+        for c in keys.chars() {
+            let ev = match c {
+                '\u{8}' => {
+                    let _ = cc_inject::backspace(1);
+                    HookEvent::Backspace
+                }
+                '\n' => {
+                    let _ = cc_inject::type_text_keys("\n", Duration::ZERO);
+                    HookEvent::Enter
+                }
+                _ => {
+                    let _ = cc_inject::type_text_keys(&c.to_string(), Duration::ZERO);
+                    HookEvent::Char(c)
+                }
+            };
+            self.on_key(ev);
+        }
+    }
+
+    fn revert_fix(&mut self) {
+        self.swallow.set_revert_until(0);
+        let Some(fix) = self.last_fix.take() else { return };
+        self.cancel_ghost();
+        let mut typed = fix.original.clone();
+        typed.push(fix.boundary);
+        if !self.replace_tail(fix.replacement.chars().count() + 1, &typed) {
+            return;
+        }
+        let n = self.reverts.entry(fix.original.clone()).or_insert(0);
+        *n += 1;
+        if *n >= 2 {
+            self.dict.add(&fix.original);
+            if let Err(e) = self.dict.save(&self.dict_path) {
+                log::warn!("dictionary save failed: {e}");
+            }
+            log::info!("added {:?} to the personal dictionary", fix.original);
+        }
+        self.dont_touch.insert(fix.original.clone());
+        log::info!("reverted {:?} -> {:?}", fix.replacement, fix.original);
+    }
+
     fn on_key(&mut self, ev: HookEvent) {
         log::trace!("key {ev:?} ghost_visible={} ghost={:?}", self.ghost_visible, self.ghost);
         self.last_key = Instant::now();
+        let modifier_only = matches!(ev, HookEvent::Other(vk) if is_modifier_vk(vk));
+        if self.last_fix.is_some() && !modifier_only && ev != HookEvent::RevertRequested {
+            self.last_fix = None;
+            self.swallow.set_revert_until(0);
+        }
         match ev {
             HookEvent::Char(c) => {
                 self.shadow.push(c);
+                if c.is_whitespace() || c.is_ascii_punctuation() {
+                    self.on_word_boundary(c);
+                    if self.last_fix.is_some() {
+                        return;
+                    }
+                }
                 if self.ghost_visible && self.ghost.starts_with(c) {
                     self.ghost.remove(0);
                     if self.ghost.trim().is_empty() {
@@ -245,9 +415,8 @@ impl App {
             HookEvent::Esc => self.cancel_ghost(),
             HookEvent::Other(vk) if is_modifier_vk(vk) => {}
             HookEvent::Left | HookEvent::Right | HookEvent::Nav | HookEvent::Other(_) => self.resync(),
-            HookEvent::RevertRequested => {
-                // M2: revert last auto-applied correction. Nothing auto-applied in M0.
-            }
+            HookEvent::RevertRequested => self.revert_fix(),
+            HookEvent::Captured(c) => self.replay.push(c),
         }
     }
 
@@ -299,6 +468,12 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if let Some(at) = self.replay_at {
+            if Instant::now() >= at {
+                self.replay_at = None;
+                self.flush_replay();
+            }
+        }
         if self.pending && self.last_key.elapsed() >= DEBOUNCE {
             self.request_completion();
         }
@@ -375,7 +550,26 @@ fn main() -> anyhow::Result<()> {
     }
 
     cc_context::init_thread().context("UIA init")?;
+    let dict_path = root.join("profiles").join("default").join("dictionary.txt");
+    if let Some(dir) = dict_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let auto_level = match std::env::var("CC_AUTO_APPLY_UP_TO").as_deref() {
+        Ok("off") => None,
+        Ok("S0") => Some(Severity::S0),
+        Ok("S2") => Some(Severity::S2),
+        _ => Some(Severity::S1),
+    };
     let app = App {
+        checker: Checker::new(),
+        dict: PersonalDictionary::load(&dict_path),
+        dict_path,
+        auto_level,
+        last_fix: None,
+        replay: String::new(),
+        replay_at: None,
+        dont_touch: HashSet::new(),
+        reverts: HashMap::new(),
         shadow: ShadowBuffer::new(),
         ghost: String::new(),
         ghost_visible: false,
@@ -391,10 +585,32 @@ fn main() -> anyhow::Result<()> {
         style: GhostStyle::default(),
         last_exe: String::new(),
         last_hwnd: 0,
+        in_terminal: false,
     };
-    log::info!("casecomplete M0 running. Type in any editable field; Tab accepts, Ctrl+Tab one word, Esc dismisses.");
+    log::info!(
+        "casecomplete running. Tab accepts, Ctrl+Tab one word, Esc dismisses; auto-fix up to {:?}, Left/Backspace within 3 s reverts.",
+        app.auto_level
+    );
     run(rx, app);
     Ok(())
+}
+
+/// CC_FIX_INJECT=slow (default) | paste | fast: how a correction is written into the field.
+fn fix_inject_mode() -> String {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| std::env::var("CC_FIX_INJECT").unwrap_or_else(|_| "keys".into())).clone()
+}
+
+/// Wait before deleting behind a just-typed boundary key (CC_FIX_PRE_DELAY_MS, default 40).
+fn fix_pre_delay_ms() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("CC_FIX_PRE_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(40))
+}
+
+/// Gap between injected keys in slow mode (CC_FIX_KEY_GAP_MS, default 4).
+fn fix_key_gap_ms() -> u64 {
+    static GAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::env::var("CC_FIX_KEY_GAP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(12))
 }
 
 /// CC_INJECT=type uses KEYEVENTF_UNICODE SendInput; the default pastes via the clipboard,

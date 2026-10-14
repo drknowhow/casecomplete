@@ -20,3 +20,4 @@ cc-context = { path = "../cc-context" }
 cc-engine = { path = "../cc-engine" }
 cc-overlay = { path = "../cc-overlay" }
 cc-inject = { path = "../cc-inject" }
+cc-correct = { path = "../cc-correct" }
