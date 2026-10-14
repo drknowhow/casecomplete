@@ -611,8 +611,12 @@ impl App {
                 );
             }
         }
-        self.ghost.push_str(&text);
-        if self.ghost.trim().is_empty() {
+        // A newline in a ghost would submit the line in chat fields and terminals.
+        self.ghost.push_str(&text.replace(['\r', '\n'], ""));
+        if self.ghost.trim().is_empty() || degenerate(&self.ghost) {
+            if degenerate(&self.ghost) {
+                self.cancel_ghost();
+            }
             return;
         }
         self.show_ghost();
@@ -631,7 +635,7 @@ impl App {
                     c.prompt_ms,
                     c.predicted_ms
                 );
-                if c.text.trim().is_empty() {
+                if c.text.trim().is_empty() || degenerate(&c.text) {
                     self.cancel_ghost();
                 } else {
                     let ev = NewEvent {
@@ -798,6 +802,24 @@ fn run(rx: Receiver<Msg>, mut app: App) {
         }
         app.tick();
     }
+}
+
+/// Runaway output such as `100000000000` or `aaaaaaa` is never worth showing.
+fn degenerate(text: &str) -> bool {
+    let mut run = 0;
+    let mut prev = None;
+    for c in text.chars() {
+        if Some(c) == prev {
+            run += 1;
+            if run >= 5 && !c.is_whitespace() {
+                return true;
+            }
+        } else {
+            run = 0;
+            prev = Some(c);
+        }
+    }
+    false
 }
 
 fn unix_ms() -> i64 {
