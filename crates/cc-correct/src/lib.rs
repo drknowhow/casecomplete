@@ -25,6 +25,16 @@ use harper_core::linting::{Lint, LintGroup, LintKind, Suggestion};
 use harper_core::spell::{Dictionary, FstDictionary};
 use harper_core::{Dialect, Document};
 
+pub mod autocorrect;
+pub use autocorrect::AutocorrectList;
+
+/// Damerau-Levenshtein distance between two words (adjacent transposition costs 1).
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    osa_distance(&a, &b)
+}
+
 /// How sure the checker is that a change is safe to apply. Lower is more automatic.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {

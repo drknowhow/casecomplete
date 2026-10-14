@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Context;
-use cc_correct::{Checker, PersonalDictionary, Severity};
+use cc_correct::{AutocorrectList, Checker, PersonalDictionary, Severity};
 use cc_engine::{Completion, CompletionClient};
 use cc_hook::{HookEvent, ShadowBuffer, SwallowState};
 use cc_overlay::{GhostStyle, Overlay};
@@ -84,6 +84,11 @@ struct App {
     checker: Checker,
     dict: PersonalDictionary,
     dict_path: PathBuf,
+    auto: AutocorrectList,
+    auto_path: PathBuf,
+    /// The last word closed by a boundary and the shadow length right after it, used to
+    /// notice when the user goes back and retypes that word differently.
+    prev_boundary: Option<(String, usize)>,
     auto_level: Option<Severity>,
     last_fix: Option<Fix>,
     /// Keys the hook swallowed during an injection, replayed once the channel has drained.
@@ -250,23 +255,40 @@ impl App {
         let text = self.shadow.text();
         let body = &text[..text.len() - boundary.len_utf8()];
         let start = body.rfind(|c| matches!(c, '.' | '!' | '?' | '\n')).map_or(0, |i| i + 1);
-        let sentence = body[start..].trim_start();
-        let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("");
-        if word.is_empty() || self.dont_touch.contains(word) || cc_correct::is_code_like(word) {
+        let sentence = body[start..].trim_start().to_string();
+        let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("").to_string();
+        self.learn_self_correction(&word);
+        if word.is_empty() || self.dont_touch.contains(&word) || cc_correct::is_code_like(&word) {
+            self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
         }
         let t0 = Instant::now();
         let n_chars = sentence.chars().count();
-        let candidate = self
-            .checker
-            .check(sentence, &self.dict)
-            .into_iter()
-            .find(|c| c.end == n_chars && c.severity <= level && sentence.ends_with(&c.original));
-        let Some(c) = candidate else { return };
+        let candidate = match self.auto.lookup(&word) {
+            Some(fix) => Some(cc_correct::Candidate {
+                start: n_chars - word.chars().count(),
+                end: n_chars,
+                original: word.clone(),
+                replacement: fix,
+                rule: "autocorrect".into(),
+                severity: Severity::S0,
+                confidence: 1.0,
+            }),
+            None => self
+                .checker
+                .check(&sentence, &self.dict)
+                .into_iter()
+                .find(|c| c.end == n_chars && c.severity <= level && sentence.ends_with(&c.original)),
+        };
+        let Some(c) = candidate else {
+            self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+            return;
+        };
         log::info!(
             "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
             c.original, c.replacement, c.rule, c.severity, c.confidence, t0.elapsed().as_millis()
         );
+        self.prev_boundary = None;
         self.cancel_ghost();
         let caret = cc_context::caret_rect();
         let mut typed = c.replacement.clone();
@@ -280,6 +302,31 @@ impl App {
         }
         self.swallow.set_revert_until(cc_hook::now_ms() + REVERT_WINDOW_MS);
         self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary });
+    }
+
+    /// If the user went back over the previous word and retyped it as a near variant, the
+    /// pair becomes an autocorrect entry: that is how the list learns your own typos.
+    fn learn_self_correction(&mut self, word: &str) {
+        let Some((prev, prev_len)) = self.prev_boundary.take() else { return };
+        let now_len = self.shadow.text().chars().count();
+        if now_len > prev_len || prev == word || prev.chars().count() < 3 || word.chars().count() < 2 {
+            return;
+        }
+        if cc_correct::is_code_like(&prev) || cc_correct::is_code_like(word) {
+            return;
+        }
+        if cc_correct::edit_distance(&prev.to_lowercase(), &word.to_lowercase()) > 2 {
+            return;
+        }
+        let prev_is_unknown = self.checker.check(&prev, &self.dict).iter().any(|c| c.rule == "spell");
+        if !prev_is_unknown {
+            return;
+        }
+        self.auto.add(&prev, word);
+        if let Err(e) = self.auto.save(&self.auto_path) {
+            log::warn!("autocorrect save failed: {e}");
+        }
+        log::info!("learned {:?} -> {:?}", prev, word);
     }
 
     /// Deletes `del` chars before the caret and types `typed`, keeping the shadow in step.
@@ -367,6 +414,10 @@ impl App {
             log::info!("added {:?} to the personal dictionary", fix.original);
         }
         self.dont_touch.insert(fix.original.clone());
+        self.auto.remove(&fix.original);
+        if let Err(e) = self.auto.save(&self.auto_path) {
+            log::warn!("autocorrect save failed: {e}");
+        }
         log::info!("reverted {:?} -> {:?}", fix.replacement, fix.original);
     }
 
@@ -550,10 +601,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     cc_context::init_thread().context("UIA init")?;
-    let dict_path = root.join("profiles").join("default").join("dictionary.txt");
-    if let Some(dir) = dict_path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    let profile = root.join("profiles").join("default");
+    std::fs::create_dir_all(&profile)?;
+    let dict_path = profile.join("dictionary.txt");
+    let auto_path = profile.join("autocorrect.txt");
     let auto_level = match std::env::var("CC_AUTO_APPLY_UP_TO").as_deref() {
         Ok("off") => None,
         Ok("S0") => Some(Severity::S0),
@@ -563,6 +614,9 @@ fn main() -> anyhow::Result<()> {
     let app = App {
         checker: Checker::new(),
         dict: PersonalDictionary::load(&dict_path),
+        auto: AutocorrectList::load(&auto_path),
+        auto_path,
+        prev_boundary: None,
         dict_path,
         auto_level,
         last_fix: None,
