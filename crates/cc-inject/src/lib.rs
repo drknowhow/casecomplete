@@ -10,6 +10,8 @@
 //!   recognise them (in addition to LLKHF_INJECTED).
 
 use anyhow::{bail, Result};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, VkKeyScanExW, HKL};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
@@ -36,6 +38,92 @@ pub fn select_back(n: usize) -> anyhow::Result<()> {
 
 pub fn press(vk: u16, ctrl: bool, shift: bool, alt: bool) -> anyhow::Result<()> {
     send(&press_inputs(vk, ctrl, shift, alt))
+}
+
+/// `type_text` one key at a time with `gap` between keys, for apps that reorder bursts.
+pub fn type_text_slow(text: &str, gap: std::time::Duration) -> anyhow::Result<()> {
+    for pair in unicode_inputs(text).chunks(2) {
+        send(pair)?;
+        std::thread::sleep(gap);
+    }
+    Ok(())
+}
+
+/// `backspace` one key at a time with `gap` between keys.
+pub fn backspace_slow(n: usize, gap: std::time::Duration) -> anyhow::Result<()> {
+    for pair in backspace_inputs(n).chunks(2) {
+        send(pair)?;
+        std::thread::sleep(gap);
+    }
+    Ok(())
+}
+
+/// Types `text` as real key presses (virtual key + scan code under the foreground window's
+/// keyboard layout), falling back to a unicode packet for characters the layout cannot
+/// produce. Indistinguishable from physical typing for the target app. `gap` of zero sends
+/// everything in one burst.
+pub fn type_text_keys(text: &str, gap: std::time::Duration) -> anyhow::Result<()> {
+    let layout = foreground_layout();
+    let mut batch: Vec<INPUT> = Vec::new();
+    for ch in text.chars() {
+        let records = key_inputs_for_char(ch, layout);
+        if gap.is_zero() {
+            batch.extend(records);
+        } else {
+            send(&records)?;
+            std::thread::sleep(gap);
+        }
+    }
+    if !batch.is_empty() {
+        send(&batch)?;
+    }
+    Ok(())
+}
+
+fn foreground_layout() -> HKL {
+    // SAFETY: plain Win32 queries; a null window yields the current thread's layout.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let tid = GetWindowThreadProcessId(hwnd, None);
+        GetKeyboardLayout(tid)
+    }
+}
+
+/// Records for one character: modifiers down, key down/up, modifiers up; or a unicode pair.
+fn key_inputs_for_char(ch: char, layout: HKL) -> Vec<INPUT> {
+    if ch == '\n' {
+        return vec![vk_event(VK_RETURN.0, false, false), vk_event(VK_RETURN.0, true, false)];
+    }
+    if ch == '\r' {
+        return Vec::new();
+    }
+    let mut units = [0u16; 2];
+    let encoded = ch.encode_utf16(&mut units);
+    if encoded.len() != 1 {
+        return encoded.iter().flat_map(|u| [unicode_event(*u, false), unicode_event(*u, true)]).collect();
+    }
+    // SAFETY: VkKeyScanExW has no preconditions.
+    let scan = unsafe { VkKeyScanExW(encoded[0], layout) };
+    if scan == -1 {
+        return vec![unicode_event(encoded[0], false), unicode_event(encoded[0], true)];
+    }
+    let vk = (scan & 0xFF) as u16;
+    let mods = ((scan >> 8) & 0xFF) as u8;
+    // Ctrl or Alt modifiers (AltGr layouts) are safer as a unicode packet.
+    if mods & 0b110 != 0 {
+        return vec![unicode_event(encoded[0], false), unicode_event(encoded[0], true)];
+    }
+    let shift = mods & 1 != 0;
+    let mut out = Vec::with_capacity(4);
+    if shift {
+        out.push(vk_event(VK_SHIFT.0, false, false));
+    }
+    out.push(vk_event(vk, false, false));
+    out.push(vk_event(vk, true, false));
+    if shift {
+        out.push(vk_event(VK_SHIFT.0, true, false));
+    }
+    out
 }
 
 /// Inserts `text` by placing it on the clipboard and sending Ctrl+V, then restores the

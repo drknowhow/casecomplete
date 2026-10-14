@@ -57,6 +57,9 @@ pub enum HookEvent {
     Nav,
     /// Left/Backspace inside the revert window, or Ctrl+Alt+Z.
     RevertRequested,
+    /// A text key swallowed while `SwallowState::capture` was set; the orchestrator must
+    /// replay it after its own injection. '\u{8}' is Backspace, '\n' is Enter.
+    Captured(char),
     /// Non-text key we do not model (Ctrl+C etc.). Carries the virtual-key code.
     Other(u32),
 }
@@ -67,6 +70,9 @@ pub struct SwallowState {
     pub ghost_visible: AtomicBool,
     /// Milliseconds since process start; Left/Backspace revert until then.
     pub revert_until_ms: AtomicU64,
+    /// While set, text keys are swallowed and reported as `Captured` so they cannot
+    /// interleave with an injection in progress.
+    pub capture: AtomicBool,
 }
 
 impl SwallowState {
@@ -75,6 +81,9 @@ impl SwallowState {
     }
     pub fn set_revert_until(&self, ms: u64) {
         self.revert_until_ms.store(ms, Ordering::SeqCst);
+    }
+    pub fn set_capture(&self, v: bool) {
+        self.capture.store(v, Ordering::SeqCst);
     }
 }
 
@@ -373,6 +382,18 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         let in_revert = now_ms() < ctx.swallow.revert_until_ms.load(Ordering::SeqCst);
 
         let (ev, swallow) = decide(vk, ctrl, alt, ghost, in_revert);
+        let capture = ctx.swallow.capture.load(Ordering::SeqCst);
+        match ev {
+            Some(HookEvent::Backspace) if capture => {
+                let _ = ctx.tx.try_send(HookEvent::Captured('\u{8}'));
+                return true;
+            }
+            Some(HookEvent::Enter) if capture => {
+                let _ = ctx.tx.try_send(HookEvent::Captured('\n'));
+                return true;
+            }
+            _ => {}
+        }
 
         // Text keys (decide() says Other), plus Ctrl+Alt+Z, which on AltGr layouts can be a
         // real character (e.g. Polish AltGr+Z) and must not be eaten as a revert.
@@ -385,16 +406,16 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
             // the target app receives, so read the unit directly instead.
             if vk == vk::PACKET {
                 if let Some(c) = char::from_u32(kb.scanCode) {
-                    let _ = ctx.tx.try_send(HookEvent::Char(c));
+                    let _ = ctx.tx.try_send(if capture { HookEvent::Captured(c) } else { HookEvent::Char(c) });
                 }
-                return false;
+                return capture;
             }
             match translate(vk, kb.scanCode) {
                 Translation::Text(buf) => {
                     for &c in &buf.chars[..buf.len] {
-                        let _ = ctx.tx.try_send(HookEvent::Char(c));
+                        let _ = ctx.tx.try_send(if capture { HookEvent::Captured(c) } else { HookEvent::Char(c) });
                     }
-                    return false;
+                    return capture;
                 }
                 // Dead key: let the app compose it; the orchestrator sees nothing.
                 Translation::Dead => return false,
