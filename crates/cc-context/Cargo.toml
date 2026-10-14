@@ -7,4 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
-windows.workspace = true
+# Win32_System_Ole: SafeArray* for TextRange::GetBoundingRectangles.
+windows = { workspace = true, features = ["Win32_System_Ole"] }
+
+[dev-dependencies]
+env_logger.workspace = true
