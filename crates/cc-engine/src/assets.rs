@@ -1,8 +1,9 @@
 //! Provisioning of the `llama-server` binaries and the base GGUF model.
 //!
 //! Binaries come from the newest ggml-org/llama.cpp release that ships Windows x64
-//! assets (CUDA preferred, CPU as fallback); the model is the Q8_0 GGUF of the BASE
-//! Qwen2.5-1.5B from a Hugging Face mirror, verified against the LFS sha256.
+//! assets (CUDA preferred, CPU as fallback); the model is the Q8_0 GGUF of one of the BASE
+//! (non-instruct) models listed in [`MODELS`] (Qwen2.5-1.5B by default) from a Hugging Face
+//! mirror, verified against the LFS sha256.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -23,14 +24,73 @@ const USER_AGENT: &str = concat!("cc-engine/", env!("CARGO_PKG_VERSION"));
 const RELEASES_LATEST: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest";
 const RELEASES_LIST: &str = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=30";
 
-/// Hugging Face repo holding GGUF quantisations of the BASE (non-instruct) Qwen2.5-1.5B.
-const MODEL_REPO: &str = "QuantFactory/Qwen2.5-1.5B-GGUF";
-/// File name of the Q8_0 quant inside [`MODEL_REPO`].
-const MODEL_FILE_REMOTE: &str = "Qwen2.5-1.5B.Q8_0.gguf";
-/// File name used under `root/models`.
-const MODEL_FILE_LOCAL: &str = "qwen2.5-1.5b-q8_0.gguf";
-/// Known size of the model file; lets a warm start skip every network call.
-const MODEL_SIZE: u64 = 1_646_572_608;
+/// Id of the model [`ensure_assets`] provisions.
+const DEFAULT_MODEL_ID: &str = "qwen2.5-1.5b";
+
+/// A base (non-instruct) GGUF model the app can choose between.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// Stable identifier (settings, CLI), e.g. `qwen2.5-1.5b`.
+    pub id: &'static str,
+    /// Human-readable name for the UI.
+    pub label: &'static str,
+    /// Publisher and country, for the UI.
+    pub origin: &'static str,
+    /// Hugging Face repo holding the GGUF quantisations.
+    pub repo: &'static str,
+    /// File name of the Q8_0 quant inside [`ModelSpec::repo`].
+    pub file_remote: &'static str,
+    /// File name used under `root/models` (lowercase, unique across [`MODELS`]).
+    pub file_local: &'static str,
+    /// Exact size in bytes; lets a warm start skip every network call.
+    pub size: u64,
+}
+
+/// The selectable base models, in display order.
+pub const MODELS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "gemma-3-1b-pt",
+        label: "Gemma 3 1B (Google)",
+        origin: "Google, US",
+        repo: "mradermacher/gemma-3-1b-pt-GGUF",
+        file_remote: "gemma-3-1b-pt.Q8_0.gguf",
+        file_local: "gemma-3-1b-pt-q8_0.gguf",
+        size: 1_069_304_992,
+    },
+    ModelSpec {
+        id: "smollm2-360m",
+        label: "SmolLM2 360M (Hugging Face)",
+        origin: "Hugging Face, FR",
+        repo: "QuantFactory/SmolLM2-360M-GGUF",
+        file_remote: "SmolLM2-360M.Q8_0.gguf",
+        file_local: "smollm2-360m-q8_0.gguf",
+        size: 386_404_352,
+    },
+    ModelSpec {
+        id: "qwen2.5-1.5b",
+        label: "Qwen2.5 1.5B (Alibaba)",
+        origin: "Alibaba, CN",
+        repo: "QuantFactory/Qwen2.5-1.5B-GGUF",
+        file_remote: "Qwen2.5-1.5B.Q8_0.gguf",
+        file_local: "qwen2.5-1.5b-q8_0.gguf",
+        size: 1_646_572_608,
+    },
+];
+
+/// Look a model up by [`ModelSpec::id`].
+pub fn model_spec(id: &str) -> Option<&'static ModelSpec> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+/// Cheap, network-free check that `model_id` is known and its file under `root/models`
+/// exists with the expected size.
+pub fn model_installed(root: &Path, model_id: &str) -> bool {
+    model_spec(model_id).is_some_and(|spec| file_has_size(&root.join("models").join(spec.file_local), spec.size))
+}
+
+fn file_has_size(path: &Path, size: u64) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == size)
+}
 
 /// Paths of the provisioned sidecar binary and model.
 #[derive(Debug, Clone)]
@@ -45,15 +105,29 @@ pub struct Assets {
 /// Layout: `root/bin/llama-server.exe` (+ DLLs, `VERSION` holding the release tag) and
 /// `root/models/qwen2.5-1.5b-q8_0.gguf`. Existing complete files are reused without any
 /// network access. Interrupted downloads resume from their `.part` file.
+///
+/// Equivalent to [`ensure_assets_for`] with the default Qwen2.5-1.5B model.
 pub async fn ensure_assets(
     root: &Path,
+    progress: impl FnMut(&str, u64, Option<u64>) + Send,
+) -> anyhow::Result<Assets> {
+    ensure_assets_for(root, DEFAULT_MODEL_ID, progress).await
+}
+
+/// Like [`ensure_assets`], but provisions the model `model_id` (see [`MODELS`]); the model
+/// lands at `root/models/<file_local>`. An unknown id fails before any file or network
+/// access.
+pub async fn ensure_assets_for(
+    root: &Path,
+    model_id: &str,
     mut progress: impl FnMut(&str, u64, Option<u64>) + Send,
 ) -> anyhow::Result<Assets> {
+    let spec = model_spec(model_id).ok_or_else(|| anyhow!("unknown model id {model_id:?}"))?;
     let progress: Progress<'_> = &mut progress;
     let bin_dir = root.join("bin");
     let models_dir = root.join("models");
     let server_exe = bin_dir.join("llama-server.exe");
-    let model = models_dir.join(MODEL_FILE_LOCAL);
+    let model = models_dir.join(spec.file_local);
 
     tokio::fs::create_dir_all(&bin_dir).await.context("creating bin dir")?;
     tokio::fs::create_dir_all(&models_dir).await.context("creating models dir")?;
@@ -67,8 +141,8 @@ pub async fn ensure_assets(
     if !server_exe.is_file() {
         install_binaries(&client, root, &bin_dir, &mut *progress).await?;
     }
-    if !model_present(&model).await {
-        install_model(&client, &model, &mut *progress).await?;
+    if !model_present(&model, spec.size).await {
+        install_model(&client, spec, &model, &mut *progress).await?;
     }
     Ok(Assets { server_exe, model })
 }
@@ -340,26 +414,33 @@ struct HfLfs {
     size: Option<u64>,
 }
 
-async fn model_present(model: &Path) -> bool {
-    tokio::fs::metadata(model).await.is_ok_and(|m| m.is_file() && m.len() == MODEL_SIZE)
+async fn model_present(model: &Path, size: u64) -> bool {
+    tokio::fs::metadata(model).await.is_ok_and(|m| m.is_file() && m.len() == size)
 }
 
 /// `(sha256, size)` of the model file according to the Hugging Face LFS metadata.
-async fn fetch_model_meta(client: &reqwest::Client) -> Result<(String, u64)> {
-    let url = format!("https://huggingface.co/api/models/{MODEL_REPO}/tree/main");
+async fn fetch_model_meta(client: &reqwest::Client, spec: &ModelSpec) -> Result<(String, u64)> {
+    let (repo, file) = (spec.repo, spec.file_remote);
+    let url = format!("https://huggingface.co/api/models/{repo}/tree/main");
     let entries: Vec<HfEntry> = get_json(client, &url).await?;
     let entry = entries
         .into_iter()
-        .find(|e| e.path == MODEL_FILE_REMOTE)
-        .ok_or_else(|| anyhow!("{MODEL_FILE_REMOTE} not found in Hugging Face repo {MODEL_REPO}"))?;
-    let lfs = entry.lfs.ok_or_else(|| anyhow!("{MODEL_FILE_REMOTE} has no LFS metadata"))?;
-    Ok((lfs.oid.to_ascii_lowercase(), lfs.size.or(entry.size).unwrap_or(MODEL_SIZE)))
+        .find(|e| e.path == file)
+        .ok_or_else(|| anyhow!("{file} not found in Hugging Face repo {repo}"))?;
+    let lfs = entry.lfs.ok_or_else(|| anyhow!("{file} has no LFS metadata"))?;
+    Ok((lfs.oid.to_ascii_lowercase(), lfs.size.or(entry.size).unwrap_or(spec.size)))
 }
 
-async fn install_model(client: &reqwest::Client, model: &Path, progress: Progress<'_>) -> Result<()> {
-    let url = format!("https://huggingface.co/{MODEL_REPO}/resolve/main/{MODEL_FILE_REMOTE}");
+async fn install_model(
+    client: &reqwest::Client,
+    spec: &ModelSpec,
+    model: &Path,
+    progress: Progress<'_>,
+) -> Result<()> {
+    let (repo, file) = (spec.repo, spec.file_remote);
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
 
-    // The repo and file must really exist before we start a 1.6 GB transfer.
+    // The repo and file must really exist before we start a multi-hundred-MB transfer.
     let head = client
         .head(&url)
         .timeout(Duration::from_secs(30))
@@ -369,7 +450,10 @@ async fn install_model(client: &reqwest::Client, model: &Path, progress: Progres
     if !head.status().is_success() {
         bail!("HEAD {url}: HTTP {}", head.status());
     }
-    let (want_sha, want_size) = fetch_model_meta(client).await?;
+    let (want_sha, want_size) = fetch_model_meta(client, spec).await?;
+    if want_size != spec.size {
+        log::warn!("{file}: Hugging Face reports {want_size} bytes, expected {}", spec.size);
+    }
 
     let part = model.with_extension("gguf.part");
     let name = model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -378,7 +462,7 @@ async fn install_model(client: &reqwest::Client, model: &Path, progress: Progres
     let got = sha256_file(&part, &format!("verify {name}"), &mut *progress).await?;
     if got != want_sha {
         let _ = tokio::fs::remove_file(&part).await;
-        bail!("sha256 mismatch for {MODEL_FILE_REMOTE}: expected {want_sha}, got {got}");
+        bail!("sha256 mismatch for {file}: expected {want_sha}, got {got}");
     }
     tokio::fs::rename(&part, model).await.context("moving model into place")?;
     Ok(())
@@ -621,6 +705,76 @@ mod tests {
         extract_zip(&b, &out).unwrap();
         assert!(out.join("llama-server.exe").is_file());
         assert!(out.join("cudart64_12.dll").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_spec_lookup() {
+        let q = model_spec("qwen2.5-1.5b").unwrap();
+        assert_eq!(q.file_local, "qwen2.5-1.5b-q8_0.gguf");
+        assert_eq!(q.file_remote, "Qwen2.5-1.5B.Q8_0.gguf");
+        assert_eq!(q.repo, "QuantFactory/Qwen2.5-1.5B-GGUF");
+        assert_eq!(q.size, 1_646_572_608);
+        assert_eq!(model_spec("gemma-3-1b-pt").unwrap().label, "Gemma 3 1B (Google)");
+        assert_eq!(model_spec("smollm2-360m").unwrap().origin, "Hugging Face, FR");
+        assert!(model_spec("nope").is_none());
+        assert!(model_spec("").is_none());
+        assert!(model_spec("Qwen2.5-1.5B").is_none(), "ids are case-sensitive");
+        assert!(model_spec(DEFAULT_MODEL_ID).is_some());
+        for m in MODELS {
+            assert_eq!(model_spec(m.id), Some(m));
+        }
+    }
+
+    #[test]
+    fn models_are_in_the_documented_order() {
+        let ids: Vec<_> = MODELS.iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["gemma-3-1b-pt", "smollm2-360m", "qwen2.5-1.5b"]);
+    }
+
+    #[test]
+    fn model_specs_are_well_formed() {
+        let mut ids = std::collections::HashSet::new();
+        let mut locals = std::collections::HashSet::new();
+        for m in MODELS {
+            assert!(ids.insert(m.id), "duplicate id {}", m.id);
+            assert!(locals.insert(m.file_local), "duplicate file_local {}", m.file_local);
+            assert_eq!(m.file_local, m.file_local.to_ascii_lowercase(), "{} not lowercase", m.file_local);
+            assert!(m.file_local.ends_with(".gguf") && m.file_remote.ends_with(".gguf"));
+            assert!(!m.file_local.contains(['/', '\\']), "{} must be a bare file name", m.file_local);
+            assert!(m.repo.contains('/'));
+            assert!(m.size > 0);
+        }
+    }
+
+    #[test]
+    fn model_installed_checks_presence_and_size() {
+        let dir = scratch("installed");
+        assert!(!model_installed(&dir, "qwen2.5-1.5b"), "no models dir yet");
+        assert!(!model_installed(&dir, "nope"));
+        let models = dir.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("qwen2.5-1.5b-q8_0.gguf"), b"truncated").unwrap();
+        assert!(!model_installed(&dir, "qwen2.5-1.5b"), "wrong size must not count as installed");
+        assert!(!model_installed(&dir, "smollm2-360m"), "other models are independent");
+
+        let small = dir.join("small.bin");
+        std::fs::write(&small, b"12345").unwrap();
+        assert!(file_has_size(&small, 5));
+        assert!(!file_has_size(&small, 4));
+        assert!(!file_has_size(&dir, 5), "a directory is not a model file");
+        assert!(!file_has_size(&dir.join("missing"), 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_model_id_fails_before_any_io() {
+        use futures_util::FutureExt;
+        let dir = scratch("unknown-id");
+        let res = ensure_assets_for(&dir, "nope", |_, _, _| {}).now_or_never().expect("must not await");
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("unknown model id"), "{err}");
+        assert!(!dir.join("bin").exists() && !dir.join("models").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

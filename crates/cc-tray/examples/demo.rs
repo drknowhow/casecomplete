@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
         enabled: true,
         auto_fix_level: "S0".to_owned(),
         status_line: "Ready - 0 fixes kept today".to_owned(),
+        model: "gemma-3-1b-pt".to_owned(),
     };
     let tray = Tray::new(state.clone())?;
     println!("tray icon created; running for {} s (choose Quit to stop early)", RUN_FOR.as_secs());
@@ -36,6 +37,7 @@ fn main() -> anyhow::Result<()> {
                     TrayEvent::Quit => break,
                     TrayEvent::Enabled(on) => state.enabled = on,
                     TrayEvent::AutoFixLevel(level) => state.auto_fix_level = level,
+                    TrayEvent::Model(model) => state.model = model,
                     TrayEvent::PauseMinutes(_) => {
                         // Pretend the app paused itself and mirror that in the menu.
                         state.enabled = false;

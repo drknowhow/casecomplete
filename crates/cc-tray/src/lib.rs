@@ -39,6 +39,8 @@ pub enum TrayEvent {
     PauseMinutes(u32),
     /// Auto-fix level chosen: `"off"` | `"S0"` | `"S1"` | `"S2"`.
     AutoFixLevel(String),
+    /// Model chosen in the "Model" submenu; carries the model id, e.g. `"gemma-3-1b-pt"`.
+    Model(String),
     OpenProfileFolder,
     ShowMetrics,
     Quit,
@@ -52,6 +54,8 @@ pub struct TrayState {
     pub auto_fix_level: String,
     /// Text of the first (disabled) menu line, also used for the tooltip.
     pub status_line: String,
+    /// Model id: `"gemma-3-1b-pt"` | `"smollm2-360m"` | `"qwen2.5-1.5b"` (case-insensitive).
+    pub model: String,
 }
 
 const TOOLTIP_BASE: &str = "CaseComplete";
@@ -76,6 +80,13 @@ const LEVELS: [(&str, &str, &str); 4] = [
     ("cc-tray.level.s0", "S0", "Typos (S0)"),
     ("cc-tray.level.s1", "S1", "Typos + grammar (S1)"),
     ("cc-tray.level.s2", "S2", "Also ambiguous (S2)"),
+];
+
+/// Models: (menu id, value reported in events, menu label).
+const MODELS: [(&str, &str, &str); 3] = [
+    ("cc-tray.model.gemma-3-1b-pt", "gemma-3-1b-pt", "Gemma 3 1B (Google)"),
+    ("cc-tray.model.smollm2-360m", "smollm2-360m", "SmolLM2 360M (Hugging Face)"),
+    ("cc-tray.model.qwen2.5-1.5b", "qwen2.5-1.5b", "Qwen2.5 1.5B (Alibaba)"),
 ];
 
 enum Cmd {
@@ -208,6 +219,8 @@ struct Ui {
     enabled: CheckMenuItem,
     levels: Vec<CheckMenuItem>,
     level: usize,
+    models: Vec<CheckMenuItem>,
+    model: usize,
 }
 
 impl Ui {
@@ -217,6 +230,11 @@ impl Ui {
                 "cc-tray: unknown auto-fix level {:?}, showing \"off\"",
                 initial.auto_fix_level
             );
+            0
+        });
+
+        let model = model_index(&initial.model).unwrap_or_else(|| {
+            log::warn!("cc-tray: unknown model {:?}, showing the first one", initial.model);
             0
         });
 
@@ -233,6 +251,15 @@ impl Ui {
             levels.iter().map(|item| item as &dyn IsMenuItem).collect();
         let autofix = Submenu::with_items("Auto-fix", true, &level_refs)
             .context("failed to build the Auto-fix submenu")?;
+        let models: Vec<CheckMenuItem> = MODELS
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _, label))| CheckMenuItem::with_id(*id, *label, true, i == model, None))
+            .collect();
+        let model_refs: Vec<&dyn IsMenuItem> =
+            models.iter().map(|item| item as &dyn IsMenuItem).collect();
+        let model_menu = Submenu::with_items("Model", true, &model_refs)
+            .context("failed to build the Model submenu")?;
         let profile = MenuItem::with_id(ID_PROFILE, "Open profile folder", true, None);
         let metrics = MenuItem::with_id(ID_METRICS, "Show metrics", true, None);
         let quit = MenuItem::with_id(ID_QUIT, "Quit", true, None);
@@ -241,8 +268,8 @@ impl Ui {
         let sep3 = PredefinedMenuItem::separator();
 
         let menu = Menu::with_items(&[
-            &status, &sep1, &enabled, &pause10, &pause60, &autofix, &sep2, &profile, &metrics,
-            &sep3, &quit,
+            &status, &sep1, &enabled, &pause10, &pause60, &autofix, &model_menu, &sep2, &profile,
+            &metrics, &sep3, &quit,
         ])
         .context("failed to build the tray menu")?;
 
@@ -260,6 +287,8 @@ impl Ui {
             enabled,
             levels,
             level,
+            models,
+            model,
         })
     }
 
@@ -316,6 +345,11 @@ impl Ui {
             ID_METRICS => Some(TrayEvent::ShowMetrics),
             ID_QUIT => Some(TrayEvent::Quit),
             other => {
+                if let Some(idx) = MODELS.iter().position(|(model_id, _, _)| *model_id == other) {
+                    let changed = idx != self.model;
+                    self.select_model(idx);
+                    return changed.then(|| TrayEvent::Model(MODELS[idx].1.to_owned()));
+                }
                 let idx = LEVELS.iter().position(|(level_id, _, _)| *level_id == other)?;
                 let changed = idx != self.level;
                 // Clicking a check item toggles it; a radio group must always keep one selected.
@@ -330,6 +364,13 @@ impl Ui {
             item.set_checked(i == idx);
         }
         self.level = idx;
+    }
+
+    fn select_model(&mut self, idx: usize) {
+        for (i, item) in self.models.iter().enumerate() {
+            item.set_checked(i == idx);
+        }
+        self.model = idx;
     }
 
     fn apply_status(&mut self, line: &str) {
@@ -348,6 +389,13 @@ impl Ui {
                 state.auto_fix_level
             ),
         }
+        match model_index(&state.model) {
+            Some(idx) => self.select_model(idx),
+            None => log::warn!(
+                "cc-tray: unknown model {:?}, keeping the current one",
+                state.model
+            ),
+        }
         if !state.status_line.is_empty() {
             self.apply_status(&state.status_line);
         }
@@ -358,6 +406,12 @@ fn level_index(level: &str) -> Option<usize> {
     LEVELS
         .iter()
         .position(|(_, value, _)| value.eq_ignore_ascii_case(level.trim()))
+}
+
+fn model_index(model: &str) -> Option<usize> {
+    MODELS
+        .iter()
+        .position(|(_, value, _)| value.eq_ignore_ascii_case(model.trim()))
 }
 
 /// Menu text for the status line. `&` would be read as a mnemonic marker.
@@ -474,6 +528,7 @@ mod tests {
             enabled: true,
             auto_fix_level: "S1".into(),
             status_line: "Ready & waiting".into(),
+            model: "smollm2-360m".into(),
         };
         let tray = Tray::new(state.clone()).expect("tray icon");
         tray.set_status("Ready - 12 fixes kept today");
@@ -481,6 +536,7 @@ mod tests {
             enabled: false,
             auto_fix_level: "off".into(),
             status_line: String::new(),
+            model: "smollm2-360m".into(),
         });
         tray.set_state(&TrayState {
             auto_fix_level: "bogus".into(),
@@ -500,6 +556,14 @@ mod tests {
         assert_eq!(level_index("S0"), Some(1));
         assert_eq!(level_index("s2"), Some(3));
         assert_eq!(level_index("S3"), None);
+    }
+
+    #[test]
+    fn model_parsing() {
+        assert_eq!(model_index("gemma-3-1b-pt"), Some(0));
+        assert_eq!(model_index("SmolLM2-360M"), Some(1));
+        assert_eq!(model_index(" qwen2.5-1.5b "), Some(2));
+        assert_eq!(model_index("qwen2.5-7b"), None);
     }
 
     #[test]

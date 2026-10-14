@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 
 use std::collections::{HashMap, HashSet};
 
+mod privacy;
+use privacy::Policy;
+
 use anyhow::Context;
 use cc_correct::{AutocorrectList, Checker, PersonalDictionary, Severity};
-use cc_engine::{Completion, CompletionClient};
+use cc_engine::{Completion, CompletionClient, Sidecar};
 use cc_hook::{HookEvent, ShadowBuffer, SwallowState};
 use cc_overlay::{GhostStyle, Overlay};
 use cc_store::{Action, NewEvent, Outcome, Source, Store};
@@ -32,7 +35,7 @@ const TUNE_EVERY: Duration = Duration::from_secs(6 * 3600);
 const STATUS_EVERY: Duration = Duration::from_secs(60);
 const STYLE_EVERY: Duration = Duration::from_secs(300);
 const UNDERLINE_FADE_MS: u32 = 1500;
-const EXCLUDED_EXES: &[&str] = &["1password.exe", "keepassxc.exe", "casecomplete.exe"];
+const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
 /// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
 /// is the only context and editability is assumed.
 const TERMINAL_EXES: &[&str] = &["windowsterminal.exe", "conhost.exe", "openconsole.exe", "wezterm-gui.exe", "alacritty.exe"];
@@ -92,11 +95,17 @@ struct Fix {
 struct Settings {
     enabled: bool,
     auto_fix_level: String,
+    #[serde(default = "default_model")]
+    model: String,
+}
+
+fn default_model() -> String {
+    DEFAULT_MODEL.into()
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { enabled: true, auto_fix_level: "S1".into() }
+        Settings { enabled: true, auto_fix_level: "S1".into(), model: default_model() }
     }
 }
 
@@ -132,6 +141,12 @@ struct App {
     store: Store,
     tray: Tray,
     profile: PathBuf,
+    root: PathBuf,
+    policy: Policy,
+    model_id: String,
+    rt: tokio::runtime::Runtime,
+    sidecar: Option<Sidecar>,
+    denied_hwnd: isize,
     enabled: bool,
     paused_until: Option<Instant>,
     /// Rules the nightly tuning demoted to suggest-only.
@@ -187,7 +202,11 @@ impl App {
     }
 
     fn save_settings(&self) {
-        let s = Settings { enabled: self.enabled, auto_fix_level: level_name(&self.auto_level) };
+        let s = Settings {
+            enabled: self.enabled,
+            auto_fix_level: level_name(&self.auto_level),
+            model: self.model_id.clone(),
+        };
         if let Ok(json) = serde_json::to_string_pretty(&s) {
             if let Err(e) = std::fs::write(self.settings_path(), json) {
                 log::warn!("settings save failed: {e}");
@@ -243,9 +262,14 @@ impl App {
                     self.shadow.reset("");
                 }
                 self.in_terminal = TERMINAL_EXES.contains(&fi.exe.as_str());
-                !fi.is_password
-                    && (fi.is_editable || self.in_terminal)
-                    && !EXCLUDED_EXES.contains(&fi.exe.as_str())
+                if let Some(why) = self.policy.denies(&fi.exe, &cc_context::window_title()) {
+                    if self.denied_hwnd != fi.hwnd {
+                        self.denied_hwnd = fi.hwnd;
+                        log::info!("privacy: off here ({why})");
+                    }
+                    return false;
+                }
+                !fi.is_password && (fi.is_editable || self.in_terminal)
             }
             None => false,
         }
@@ -267,6 +291,10 @@ impl App {
         }
         let ctx = self.shadow.text().to_string();
         if ctx.trim().split_whitespace().count() < 2 {
+            return;
+        }
+        if let Some(why) = privacy::sensitive(&ctx) {
+            log::debug!("privacy: no completion ({why})");
             return;
         }
         self.cancel_ghost();
@@ -373,6 +401,10 @@ impl App {
         let start = body.rfind(|c| matches!(c, '.' | '!' | '?' | '\n')).map_or(0, |i| i + 1);
         let sentence = body[start..].trim_start().to_string();
         let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("").to_string();
+        if privacy::sensitive(&sentence).is_some() {
+            self.prev_boundary = None;
+            return;
+        }
         self.learn_self_correction(&word);
         if word.is_empty() || self.dont_touch.contains(&word) || cc_correct::is_code_like(&word) {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
@@ -419,7 +451,10 @@ impl App {
                 rule: c.rule.clone(),
                 severity: format!("{:?}", c.severity),
                 confidence: c.confidence,
-                context_before: Some(sentence.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect()),
+                context_before: self
+                    .policy
+                    .store_context
+                    .then(|| sentence.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect()),
                 original: c.original.clone(),
                 replacement: c.replacement.clone(),
                 action: Action::Auto,
@@ -765,6 +800,7 @@ impl App {
                 let _ = std::process::Command::new("explorer.exe").arg(&self.profile).spawn();
             }
             TrayEvent::ShowMetrics => self.refresh_status(true),
+            TrayEvent::Model(id) => self.switch_model(&id),
             TrayEvent::Quit => {
                 log::info!("quit from tray");
                 std::process::exit(0);
@@ -773,8 +809,61 @@ impl App {
         self.tray.set_state(&TrayState {
             enabled: self.enabled,
             auto_fix_level: level_name(&self.auto_level),
+            model: self.model_id.clone(),
             status_line: String::new(),
         });
+    }
+
+    /// Downloads the model if needed and restarts the engine on it. On failure the
+    /// previous model is brought back.
+    fn switch_model(&mut self, id: &str) {
+        if id == self.model_id || cc_engine::model_spec(id).is_none() {
+            return;
+        }
+        self.cancel_ghost();
+        let previous = self.model_id.clone();
+        self.sidecar = None;
+        match self.start_engine(id) {
+            Ok(()) => {
+                self.model_id = id.to_string();
+                self.save_settings();
+                self.refresh_status(true);
+            }
+            Err(e) => {
+                log::warn!("switching to {id} failed: {e:#}; back to {previous}");
+                self.tray.set_status(&format!("Model switch failed: {e}"));
+                if let Err(e) = self.start_engine(&previous) {
+                    log::error!("restarting {previous} failed: {e:#}");
+                }
+            }
+        }
+    }
+
+    fn start_engine(&mut self, id: &str) -> anyhow::Result<()> {
+        let root = self.root.clone();
+        let tray = &self.tray;
+        let label = cc_engine::model_spec(id).map_or(id, |m| m.label);
+        tray.set_status(&format!("Loading {label}"));
+        let sidecar = self.rt.block_on(async {
+            let mut last = Instant::now() - Duration::from_secs(5);
+            let assets = cc_engine::ensure_assets_for(&root, id, |what, done, total| {
+                if last.elapsed() >= Duration::from_secs(2) {
+                    last = Instant::now();
+                    let line = match total {
+                        Some(t) => format!("{what}: {} / {} MB", done >> 20, t >> 20),
+                        None => format!("{what}: {} MB", done >> 20),
+                    };
+                    log::info!("{line}");
+                    tray.set_status(&line);
+                }
+            })
+            .await
+            .context("ensure assets")?;
+            Sidecar::start(&assets, PORT).await.context("start llama-server")
+        })?;
+        log::info!("engine ready: {} ({label})", sidecar.base_url());
+        self.sidecar = Some(sidecar);
+        Ok(())
     }
 
     fn refresh_status(&mut self, log_it: bool) {
@@ -919,25 +1008,6 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
 
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let (assets, sidecar) = rt.block_on(async {
-        let mut last = Instant::now();
-        let assets = cc_engine::ensure_assets(&root, |label, done, total| {
-            if last.elapsed() > Duration::from_secs(2) {
-                last = Instant::now();
-                match total {
-                    Some(t) => log::info!("{label}: {} / {} MB", done >> 20, t >> 20),
-                    None => log::info!("{label}: {} MB", done >> 20),
-                }
-            }
-        })
-        .await
-        .context("ensure assets")?;
-        let sidecar = cc_engine::Sidecar::start(&assets, PORT).await.context("start llama-server")?;
-        anyhow::Ok((assets, sidecar))
-    })?;
-    log::info!("engine ready: {} ({})", sidecar.base_url(), assets.model.display());
-    // keep the sidecar alive for the lifetime of the app
-    let _sidecar = sidecar;
 
     let (tx, rx) = unbounded::<Msg>();
     let client = CompletionClient::new(&sidecar_url());
@@ -975,17 +1045,30 @@ fn main() -> anyhow::Result<()> {
         Err(_) => parse_level(&settings.auto_fix_level),
     };
     let store = Store::open(&profile.join("events.db")).context("open events.db")?;
+    let model_id = match std::env::var("CC_MODEL") {
+        Ok(m) if cc_engine::model_spec(&m).is_some() => m,
+        _ if cc_engine::model_spec(&settings.model).is_some() => settings.model.clone(),
+        _ => DEFAULT_MODEL.to_string(),
+    };
     let tray = Tray::new(TrayState {
         enabled: settings.enabled,
         auto_fix_level: level_name(&auto_level),
+        model: model_id.clone(),
         status_line: "Starting".into(),
     })
     .context("tray icon")?;
+    let policy = Policy::load(&profile.join("privacy.toml"));
     let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
     let mut app = App {
         store,
         tray,
         profile: profile.clone(),
+        root: root.clone(),
+        policy,
+        model_id: model_id.clone(),
+        rt,
+        sidecar: None,
+        denied_hwnd: 0,
         enabled: settings.enabled,
         paused_until: None,
         demoted: HashSet::new(),
@@ -1031,6 +1114,7 @@ fn main() -> anyhow::Result<()> {
         last_hwnd: 0,
         in_terminal: false,
     };
+    app.start_engine(&model_id).context("engine")?;
     app.run_tuning();
     app.refresh_status(true);
     log::info!(

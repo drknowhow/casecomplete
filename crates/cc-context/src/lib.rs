@@ -164,6 +164,21 @@ pub fn init_thread() -> anyhow::Result<()> {
 /// focused element. None only when there is no foreground window. If UIA cannot answer
 /// (not initialised, provider hung or failing) the result has `control_type: None`,
 /// `is_editable: false` and `is_password` from the Win32 ES_PASSWORD style.
+/// Title of the foreground window, for the privacy denylist. Empty when unavailable.
+pub fn window_title() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    // SAFETY: GetWindowTextW writes at most buf.len() UTF-16 units and NUL-terminates.
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return String::new();
+        }
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(fg, &mut buf);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+}
+
 pub fn focus_info() -> Option<FocusInfo> {
     unsafe {
         let fg = GetForegroundWindow();
