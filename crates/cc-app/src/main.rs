@@ -16,6 +16,8 @@ use cc_correct::{AutocorrectList, Checker, PersonalDictionary, Severity};
 use cc_engine::{Completion, CompletionClient};
 use cc_hook::{HookEvent, ShadowBuffer, SwallowState};
 use cc_overlay::{GhostStyle, Overlay};
+use cc_store::{Action, NewEvent, Outcome, Source, Store};
+use cc_tray::{Tray, TrayEvent, TrayState};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +26,11 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 const N_PREDICT: u32 = 24;
 const CONTEXT_CHARS: usize = 800;
 const REVERT_WINDOW_MS: u64 = 3000;
+/// A fix nobody touched for this long counts as kept.
+const KEPT_AFTER: Duration = Duration::from_secs(10);
+const TUNE_EVERY: Duration = Duration::from_secs(6 * 3600);
+const STATUS_EVERY: Duration = Duration::from_secs(60);
+const STYLE_EVERY: Duration = Duration::from_secs(300);
 const UNDERLINE_FADE_MS: u32 = 1500;
 const EXCLUDED_EXES: &[&str] = &["1password.exe", "keepassxc.exe", "casecomplete.exe"];
 /// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
@@ -78,6 +85,37 @@ struct Fix {
     original: String,
     replacement: String,
     boundary: char,
+    event_id: i64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    enabled: bool,
+    auto_fix_level: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { enabled: true, auto_fix_level: "S1".into() }
+    }
+}
+
+fn parse_level(s: &str) -> Option<Severity> {
+    match s {
+        "off" => None,
+        "S0" => Some(Severity::S0),
+        "S2" => Some(Severity::S2),
+        _ => Some(Severity::S1),
+    }
+}
+
+fn level_name(level: &Option<Severity>) -> String {
+    match level {
+        None => "off".into(),
+        Some(Severity::S0) => "S0".into(),
+        Some(Severity::S1) => "S1".into(),
+        Some(_) => "S2".into(),
+    }
 }
 
 struct App {
@@ -91,6 +129,21 @@ struct App {
     prev_boundary: Option<(String, usize)>,
     auto_level: Option<Severity>,
     last_fix: Option<Fix>,
+    store: Store,
+    tray: Tray,
+    profile: PathBuf,
+    enabled: bool,
+    paused_until: Option<Instant>,
+    /// Rules the nightly tuning demoted to suggest-only.
+    demoted: HashSet<String>,
+    /// (event id, applied at, shadow length right after) of the last auto fix awaiting an outcome.
+    pending_fix_event: Option<(i64, Instant, usize)>,
+    pending_completion_event: Option<i64>,
+    completion_latency_ms: u32,
+    style_lines: Vec<String>,
+    style_refreshed: Instant,
+    last_tune: Instant,
+    last_status: Instant,
     /// Keys the hook swallowed during an injection, replayed once the channel has drained.
     replay: String,
     replay_at: Option<Instant>,
@@ -115,7 +168,33 @@ struct App {
 }
 
 impl App {
+    fn active(&self) -> bool {
+        self.enabled && self.paused_until.is_none_or(|t| Instant::now() >= t)
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        self.profile.join("settings.json")
+    }
+
+    fn save_settings(&self) {
+        let s = Settings { enabled: self.enabled, auto_fix_level: level_name(&self.auto_level) };
+        if let Ok(json) = serde_json::to_string_pretty(&s) {
+            if let Err(e) = std::fs::write(self.settings_path(), json) {
+                log::warn!("settings save failed: {e}");
+            }
+        }
+    }
+
+    fn outcome(&mut self, id: i64, outcome: Outcome) {
+        if let Err(e) = self.store.set_outcome(id, outcome) {
+            log::warn!("store outcome failed: {e:#}");
+        }
+    }
+
     fn cancel_ghost(&mut self) {
+        if let Some(id) = self.pending_completion_event.take() {
+            self.outcome(id, Outcome::Ignored);
+        }
         if !self.ghost.is_empty() || self.ghost_visible {
             self.overlay.hide();
         }
@@ -143,6 +222,9 @@ impl App {
     fn field_allowed(&mut self) -> bool {
         match cc_context::focus_info() {
             Some(fi) => {
+                if !self.active() {
+                    return false;
+                }
                 if fi.hwnd != self.last_hwnd {
                     log::info!("focus: {} editable={} password={}", fi.exe, fi.is_editable, fi.is_password);
                     self.last_exe = fi.exe.clone();
@@ -178,6 +260,8 @@ impl App {
             return;
         }
         self.cancel_ghost();
+        // Recently accepted sentences in this app give the base model your voice.
+        let ctx = if self.style_lines.is_empty() { ctx } else { format!("{}\n\n{}", self.style_lines.join("\n"), ctx) };
         self.gen += 1;
         self.req_started = Some(Instant::now());
         self.first_token_logged = false;
@@ -210,6 +294,9 @@ impl App {
         self.overlay.hide();
         self.ghost_visible = false;
         self.swallow.set_ghost_visible(false);
+        if let Some(id) = self.pending_completion_event.take() {
+            self.outcome(id, Outcome::Accepted);
+        }
         let text = if whole {
             std::mem::take(&mut self.ghost)
         } else {
@@ -278,7 +365,12 @@ impl App {
                 .checker
                 .check(&sentence, &self.dict)
                 .into_iter()
-                .find(|c| c.end == n_chars && c.severity <= level && sentence.ends_with(&c.original)),
+                .find(|c| {
+                    c.end == n_chars
+                        && c.severity <= level
+                        && sentence.ends_with(&c.original)
+                        && !self.demoted.contains(&c.rule)
+                }),
         };
         let Some(c) = candidate else {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
@@ -290,6 +382,24 @@ impl App {
         );
         self.prev_boundary = None;
         self.cancel_ghost();
+        let event_id = self
+            .store
+            .log(&NewEvent {
+                app_exe: self.last_exe.clone(),
+                source: if c.rule == "autocorrect" { Source::Autocorrect } else { Source::Harper },
+                rule: c.rule.clone(),
+                severity: format!("{:?}", c.severity),
+                confidence: c.confidence,
+                context_before: Some(sentence.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect()),
+                original: c.original.clone(),
+                replacement: c.replacement.clone(),
+                action: Action::Auto,
+                latency_ms: t0.elapsed().as_millis() as u32,
+            })
+            .unwrap_or_else(|e| {
+                log::warn!("store log failed: {e:#}");
+                0
+            });
         let caret = cc_context::caret_rect();
         let mut typed = c.replacement.clone();
         typed.push(boundary);
@@ -301,7 +411,10 @@ impl App {
             self.overlay.show_underline(cc_overlay::Rect { x: r.x - w, y: r.y, w, h: r.h }, UNDERLINE_FADE_MS);
         }
         self.swallow.set_revert_until(cc_hook::now_ms() + REVERT_WINDOW_MS);
-        self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary });
+        if let Some((id, _, _)) = self.pending_fix_event.replace((event_id, Instant::now(), self.shadow.text().chars().count())) {
+            self.outcome(id, Outcome::Kept);
+        }
+        self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary, event_id });
     }
 
     /// If the user went back over the previous word and retyped it as a near variant, the
@@ -413,6 +526,8 @@ impl App {
             }
             log::info!("added {:?} to the personal dictionary", fix.original);
         }
+        self.pending_fix_event = None;
+        self.outcome(fix.event_id, Outcome::Reverted);
         self.dont_touch.insert(fix.original.clone());
         self.auto.remove(&fix.original);
         if let Err(e) = self.auto.save(&self.auto_path) {
@@ -423,6 +538,10 @@ impl App {
 
     fn on_key(&mut self, ev: HookEvent) {
         log::trace!("key {ev:?} ghost_visible={} ghost={:?}", self.ghost_visible, self.ghost);
+        if !self.active() {
+            self.cancel_ghost();
+            return;
+        }
         self.last_key = Instant::now();
         let modifier_only = matches!(ev, HookEvent::Other(vk) if is_modifier_vk(vk));
         if self.last_fix.is_some() && !modifier_only && ev != HookEvent::RevertRequested {
@@ -453,6 +572,12 @@ impl App {
             }
             HookEvent::Backspace => {
                 self.shadow.backspace();
+                if let Some((id, _, len)) = self.pending_fix_event {
+                    if self.shadow.text().chars().count() < len {
+                        self.pending_fix_event = None;
+                        self.outcome(id, Outcome::Overwritten);
+                    }
+                }
                 self.cancel_ghost();
                 self.pending = true;
             }
@@ -477,10 +602,11 @@ impl App {
         }
         if !self.first_token_logged {
             self.first_token_logged = true;
+            self.completion_latency_ms = self.last_key.elapsed().as_millis() as u32;
             if let Some(t0) = self.req_started {
                 log::info!(
                     "latency: keystroke->first token {} ms (request->first {} ms)",
-                    self.last_key.elapsed().as_millis(),
+                    self.completion_latency_ms,
                     t0.elapsed().as_millis()
                 );
             }
@@ -507,6 +633,23 @@ impl App {
                 );
                 if c.text.trim().is_empty() {
                     self.cancel_ghost();
+                } else {
+                    let ev = NewEvent {
+                        app_exe: self.last_exe.clone(),
+                        source: Source::LlmComplete,
+                        rule: "complete".into(),
+                        severity: "S4".into(),
+                        confidence: c.mean_logprob.map_or(0.0, |lp| lp.exp()),
+                        context_before: None,
+                        original: String::new(),
+                        replacement: c.text.clone(),
+                        action: Action::Suggested,
+                        latency_ms: self.completion_latency_ms,
+                    };
+                    match self.store.log(&ev) {
+                        Ok(id) => self.pending_completion_event = Some(id),
+                        Err(e) => log::warn!("store log failed: {e:#}"),
+                    }
                 }
             }
             Err(e) => {
@@ -518,7 +661,120 @@ impl App {
         }
     }
 
+    fn on_tray(&mut self, ev: TrayEvent) {
+        log::info!("tray: {ev:?}");
+        match ev {
+            TrayEvent::Enabled(b) => {
+                self.enabled = b;
+                self.paused_until = None;
+                if !b {
+                    self.cancel_ghost();
+                }
+                self.save_settings();
+            }
+            TrayEvent::PauseMinutes(m) => {
+                self.paused_until = Some(Instant::now() + Duration::from_secs(u64::from(m) * 60));
+                self.cancel_ghost();
+            }
+            TrayEvent::AutoFixLevel(s) => {
+                self.auto_level = parse_level(&s);
+                self.save_settings();
+            }
+            TrayEvent::OpenProfileFolder => {
+                let _ = std::process::Command::new("explorer.exe").arg(&self.profile).spawn();
+            }
+            TrayEvent::ShowMetrics => self.refresh_status(true),
+            TrayEvent::Quit => {
+                log::info!("quit from tray");
+                std::process::exit(0);
+            }
+        }
+        self.tray.set_state(&TrayState {
+            enabled: self.enabled,
+            auto_fix_level: level_name(&self.auto_level),
+            status_line: String::new(),
+        });
+    }
+
+    fn refresh_status(&mut self, log_it: bool) {
+        self.last_status = Instant::now();
+        let day_ago = unix_ms() - 24 * 3600 * 1000;
+        match self.store.metrics(Some(day_ago)) {
+            Ok(m) => {
+                let state = if !self.enabled {
+                    "Off"
+                } else if self.paused_until.is_some_and(|t| Instant::now() < t) {
+                    "Paused"
+                } else {
+                    "Ready"
+                };
+                let line = format!(
+                    "{state} · 24h: {} fixes kept, {} reverted, {} sentences accepted, {} chars saved, p50 {} ms",
+                    m.fixes_auto.saturating_sub(m.fixes_reverted), m.fixes_reverted, m.completions_accepted, m.chars_saved, m.p50_latency_ms
+                );
+                if log_it {
+                    log::info!("{line}");
+                }
+                self.tray.set_status(&line);
+            }
+            Err(e) => log::warn!("metrics failed: {e:#}"),
+        }
+    }
+
+    fn run_tuning(&mut self) {
+        self.last_tune = Instant::now();
+        match self.store.expire_pending(24 * 3600 * 1000) {
+            Ok(n) if n > 0 => log::info!("expired {n} pending events"),
+            Err(e) => log::warn!("expire failed: {e:#}"),
+            _ => {}
+        }
+        match self.store.tune() {
+            Ok(changes) => {
+                for c in &changes {
+                    log::info!("tuning: {c:?}");
+                    if let cc_store::Tuning::Demote { rule, .. } = c {
+                        self.demoted.insert(rule.clone());
+                    }
+                }
+            }
+            Err(e) => log::warn!("tune failed: {e:#}"),
+        }
+    }
+
+    fn refresh_style(&mut self) {
+        self.style_refreshed = Instant::now();
+        let app = if self.last_exe.is_empty() { None } else { Some(self.last_exe.as_str()) };
+        match self.store.recent_accepted(6, app) {
+            Ok(lines) => {
+                let lines: Vec<String> = lines.into_iter().map(|l| l.trim().to_string()).filter(|l| l.len() > 10).collect();
+                if lines != self.style_lines {
+                    log::debug!("style prefix: {} lines", lines.len());
+                    self.style_lines = lines;
+                }
+            }
+            Err(e) => log::warn!("recent_accepted failed: {e:#}"),
+        }
+    }
+
     fn tick(&mut self) {
+        while let Ok(ev) = self.tray.events().try_recv() {
+            self.on_tray(ev);
+        }
+        if let Some((id, at, _)) = self.pending_fix_event {
+            if at.elapsed() >= KEPT_AFTER {
+                self.pending_fix_event = None;
+                self.outcome(id, Outcome::Kept);
+            }
+        }
+        if self.last_status.elapsed() >= STATUS_EVERY {
+            self.refresh_status(false);
+        }
+        if self.last_tune.elapsed() >= TUNE_EVERY {
+            self.run_tuning();
+        }
+        if self.style_refreshed.elapsed() >= STYLE_EVERY {
+            self.refresh_style();
+        }
         if let Some(at) = self.replay_at {
             if Instant::now() >= at {
                 self.replay_at = None;
@@ -542,6 +798,12 @@ fn run(rx: Receiver<Msg>, mut app: App) {
         }
         app.tick();
     }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 fn data_root() -> PathBuf {
@@ -605,13 +867,36 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&profile)?;
     let dict_path = profile.join("dictionary.txt");
     let auto_path = profile.join("autocorrect.txt");
-    let auto_level = match std::env::var("CC_AUTO_APPLY_UP_TO").as_deref() {
-        Ok("off") => None,
-        Ok("S0") => Some(Severity::S0),
-        Ok("S2") => Some(Severity::S2),
-        _ => Some(Severity::S1),
+    let settings: Settings = std::fs::read_to_string(profile.join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let auto_level = match std::env::var("CC_AUTO_APPLY_UP_TO") {
+        Ok(s) => parse_level(&s),
+        Err(_) => parse_level(&settings.auto_fix_level),
     };
-    let app = App {
+    let store = Store::open(&profile.join("events.db")).context("open events.db")?;
+    let tray = Tray::new(TrayState {
+        enabled: settings.enabled,
+        auto_fix_level: level_name(&auto_level),
+        status_line: "Starting".into(),
+    })
+    .context("tray icon")?;
+    let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
+    let mut app = App {
+        store,
+        tray,
+        profile: profile.clone(),
+        enabled: settings.enabled,
+        paused_until: None,
+        demoted: HashSet::new(),
+        pending_fix_event: None,
+        pending_completion_event: None,
+        completion_latency_ms: 0,
+        style_lines: Vec::new(),
+        style_refreshed: long_ago,
+        last_tune: long_ago,
+        last_status: long_ago,
         checker: Checker::new(),
         dict: PersonalDictionary::load(&dict_path),
         auto: AutocorrectList::load(&auto_path),
@@ -641,6 +926,8 @@ fn main() -> anyhow::Result<()> {
         last_hwnd: 0,
         in_terminal: false,
     };
+    app.run_tuning();
+    app.refresh_status(true);
     log::info!(
         "casecomplete running. Tab accepts, Ctrl+Tab one word, Esc dismisses; auto-fix up to {:?}, Left/Backspace within 3 s reverts.",
         app.auto_level

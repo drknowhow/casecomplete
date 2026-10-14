@@ -21,3 +21,7 @@ cc-engine = { path = "../cc-engine" }
 cc-overlay = { path = "../cc-overlay" }
 cc-inject = { path = "../cc-inject" }
 cc-correct = { path = "../cc-correct" }
+cc-store = { path = "../cc-store" }
+cc-tray = { path = "../cc-tray" }
+serde.workspace = true
+serde_json.workspace = true
