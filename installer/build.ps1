@@ -13,8 +13,9 @@ if (-not $Version) {
 cargo build --release -p cc-app
 if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 
-$exe = "$root\target\release\casecomplete.exe"
-if (-not (Test-Path "$PSScriptRoot\casecomplete.ico")) { python "$PSScriptRoot\make_icon.py" }
+$targetDir = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).target_directory
+$exe = Join-Path $targetDir "release\casecomplete.exe"
+python -I "$PSScriptRoot\make_icon.py"
 New-Item -ItemType Directory -Force "$PSScriptRoot\out" | Out-Null
 $msi = "$PSScriptRoot\out\CaseComplete-$Version.msi"
 

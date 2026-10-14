@@ -41,6 +41,8 @@
 
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="dialog.bmp" />
 
     <!-- Launch after install from the exit dialog. -->
     <Property Id="WixShellExecTarget" Value="[#CaseCompleteExe]" />

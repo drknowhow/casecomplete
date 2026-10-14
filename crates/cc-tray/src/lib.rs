@@ -487,7 +487,7 @@ fn tooltip_for(status: &str) -> String {
     }
 }
 
-/// A 32x32 rounded blue square with a white "C", drawn with 4x4 supersampling.
+/// The 32x32 Tab-key brand mark, drawn with 4x4 supersampling.
 fn make_icon() -> Result<Icon> {
     let (rgba, size) = icon_rgba();
     Icon::from_rgba(rgba, size, size).context("failed to build the tray icon image")
@@ -497,58 +497,90 @@ const ICON_SIZE: u32 = 32;
 
 fn icon_rgba() -> (Vec<u8>, u32) {
     const SAMPLES: u32 = 4;
-    const BLUE: [f32; 3] = [37.0, 99.0, 235.0];
     let total = (SAMPLES * SAMPLES) as f32;
+    let size = ICON_SIZE as f32;
     let mut rgba = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
     for py in 0..ICON_SIZE {
         for px in 0..ICON_SIZE {
-            let (mut in_square, mut in_letter) = (0u32, 0u32);
+            let (mut sum, mut hits) = ([0.0f32; 3], 0u32);
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
-                    let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
-                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
-                    if in_rounded_square(x, y) {
-                        in_square += 1;
-                        if in_letter_c(x, y) {
-                            in_letter += 1;
+                    let u = (px as f32 + (sx as f32 + 0.5) / SAMPLES as f32) / size;
+                    let v = (py as f32 + (sy as f32 + 0.5) / SAMPLES as f32) / size;
+                    if let Some(c) = mark_at(u, v) {
+                        for (s, channel) in sum.iter_mut().zip(c) {
+                            *s += channel as f32;
                         }
+                        hits += 1;
                     }
                 }
             }
-            if in_square == 0 {
+            if hits == 0 {
                 rgba.extend_from_slice(&[0, 0, 0, 0]);
                 continue;
             }
-            let white = in_letter as f32 / in_square as f32;
-            for channel in BLUE {
-                rgba.push((channel * (1.0 - white) + 255.0 * white).round() as u8);
+            for s in sum {
+                rgba.push((s / hits as f32).round() as u8);
             }
-            rgba.push((in_square as f32 / total * 255.0).round() as u8);
+            rgba.push((hits as f32 / total * 255.0).round() as u8);
         }
     }
     (rgba, ICON_SIZE)
 }
 
-/// Square inset by one pixel with a corner radius of 7 px.
-fn in_rounded_square(x: f32, y: f32) -> bool {
-    const LO: f32 = 1.0;
-    const HI: f32 = ICON_SIZE as f32 - 1.0;
-    const R: f32 = 7.0;
-    if !(LO..=HI).contains(&x) || !(LO..=HI).contains(&y) {
-        return false;
+/// Signal blue keycap, ink bottom edge, white glyph.
+const BLUE: [u8; 3] = [0x3A, 0x7B, 0xD5];
+const INK: [u8; 3] = [0x17, 0x19, 0x1C];
+const WHITE: [u8; 3] = [0xFF, 0xFF, 0xFF];
+/// Keycap geometry as fractions of the icon: transparent border, corner radius
+/// (of the keycap width), ink edge height, glyph stroke width.
+const MARGIN: f32 = 1.0 / 32.0;
+const RADIUS: f32 = 0.22 * (1.0 - 2.0 * MARGIN);
+const EDGE: f32 = 4.0 / 120.0;
+const STROKE: f32 = 0.10;
+/// Mid line of the glyph: the centre of the keycap face.
+const GLYPH_Y: f32 = MARGIN + (1.0 - 2.0 * MARGIN - EDGE) / 2.0;
+/// The tab glyph as round-capped segments on the reference SVG's 120-unit
+/// grid (x, y relative to the mid line): bar, arrowhead (two strokes), stop bar.
+const GLYPH: [([f32; 2], [f32; 2]); 4] = [
+    ([30.0, 0.0], [78.0, 0.0]),
+    ([64.0, -18.0], [84.0, 0.0]),
+    ([84.0, 0.0], [64.0, 18.0]),
+    ([92.0, -20.0], [92.0, 20.0]),
+];
+
+/// The mark's colour at (u, v) on the unit square, or `None` where transparent.
+fn mark_at(u: f32, v: f32) -> Option<[u8; 3]> {
+    if in_keycap(u, v, MARGIN) {
+        return Some(if on_glyph(u, v) { WHITE } else { BLUE });
     }
-    let dx = x - x.clamp(LO + R, HI - R);
-    let dy = y - y.clamp(LO + R, HI - R);
-    dx * dx + dy * dy <= R * R
+    in_keycap(u, v, MARGIN + EDGE).then_some(INK)
 }
 
-/// A ring (radius 5..10 around the centre) open towards the right.
-fn in_letter_c(x: f32, y: f32) -> bool {
-    const CENTER: f32 = ICON_SIZE as f32 / 2.0;
-    const OPENING_HALF_ANGLE: f32 = 0.7; // radians, about 40 degrees
-    let (dx, dy) = (x - CENTER, y - CENTER);
-    let dist = (dx * dx + dy * dy).sqrt();
-    (5.0..=10.0).contains(&dist) && dy.atan2(dx).abs() > OPENING_HALF_ANGLE
+/// Rounded square whose top edge is at `top`; the face and the edge below it
+/// are the same shape, shifted by `EDGE`.
+fn in_keycap(u: f32, v: f32, top: f32) -> bool {
+    let (lo, hi) = (MARGIN, 1.0 - MARGIN);
+    let bottom = top + (1.0 - 2.0 * MARGIN - EDGE);
+    if !(lo..=hi).contains(&u) || !(top..=bottom).contains(&v) {
+        return false;
+    }
+    let dx = u - u.clamp(lo + RADIUS, hi - RADIUS);
+    let dy = v - v.clamp(top + RADIUS, bottom - RADIUS);
+    dx * dx + dy * dy <= RADIUS * RADIUS
+}
+
+/// Within half a stroke of any glyph segment.
+fn on_glyph(u: f32, v: f32) -> bool {
+    const GRID: f32 = 120.0;
+    GLYPH.iter().any(|&([ax, ay], [bx, by])| {
+        let (ax, ay) = (ax / GRID, GLYPH_Y + ay / GRID);
+        let (bx, by) = (bx / GRID, GLYPH_Y + by / GRID);
+        let (dx, dy) = (bx - ax, by - ay);
+        let t = (((u - ax) * dx + (v - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        let (ex, ey) = (ax + t * dx - u, ay + t * dy - v);
+        ex * ex + ey * ey <= (STROKE / 2.0) * (STROKE / 2.0)
+    })
 }
 
 #[cfg(test)]
@@ -562,9 +594,11 @@ mod tests {
         assert_eq!(rgba.len(), 32 * 32 * 4);
         let px = |x: usize, y: usize| &rgba[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
         assert_eq!(px(0, 0)[3], 0, "corner is transparent");
-        assert_eq!(px(16, 3), &[37, 99, 235, 255], "background is opaque blue");
-        assert_eq!(px(6, 16), &[255, 255, 255, 255], "left stroke of the C is white");
-        assert_eq!(px(26, 16)[..3], [37, 99, 235], "opening of the C shows the background");
+        assert_eq!(px(16, 3), &[0x3A, 0x7B, 0xD5, 255], "keycap face is opaque signal blue");
+        assert_eq!(px(4, 16)[..3], [0x3A, 0x7B, 0xD5], "left of the glyph shows the keycap");
+        assert_eq!(px(12, 15), &[255, 255, 255, 255], "the tab arrow's bar is white");
+        assert_eq!(px(24, 12), &[255, 255, 255, 255], "the stop bar is white");
+        assert_eq!(px(16, 30), &[0x17, 0x19, 0x1C, 255], "keycap bottom edge is ink");
         assert!(make_icon().is_ok());
     }
 

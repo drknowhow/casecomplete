@@ -47,6 +47,15 @@
   const pct = (a, b) => (b > 0 ? Math.round((100 * a) / b) : 0);
   const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
+  // The Tab-key brand mark: signal-blue keycap on an ink edge, white tab glyph.
+  // Sized by CSS (.logo); decorative, the wordmark next to it carries the name.
+  const MARK = '<svg class="logo" viewBox="0 0 120 116" aria-hidden="true" focusable="false">'
+    + '<rect x="6" y="10" width="108" height="100" rx="22" fill="#17191C"/>'
+    + '<rect x="6" y="6" width="108" height="100" rx="22" fill="#3A7BD5"/>'
+    + '<path d="M30 56 H78" stroke="#fff" stroke-width="11" stroke-linecap="round"/>'
+    + '<path d="M64 38 L84 56 L64 74" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>'
+    + '<path d="M92 36 V76" stroke="#fff" stroke-width="11" stroke-linecap="round"/></svg>';
+
   const APP_NAMES = {
     'code.exe': 'VS Code', 'claude.exe': 'Claude', 'chrome.exe': 'Chrome', 'msedge.exe': 'Edge',
     'firefox.exe': 'Firefox', 'outlook.exe': 'Outlook', 'olk.exe': 'Outlook', 'winword.exe': 'Word',
@@ -312,7 +321,7 @@
     const s = statusOf(st);
     const items = [['overview', 'Overview'], ['insights', 'Insights'], ['context', 'Context'], ['settings', 'Settings'], ['words', 'Your words'], ['log', 'Log']];
     return `<nav class="side" aria-label="Sections">
-      <div class="brand"><span class="logo">C</span><span>CaseComplete</span></div>
+      <div class="brand">${MARK}<span class="wm"><span>CaseComplete</span>${S.page === 'overview' ? '<span class="tagline">Just type.</span>' : ''}</span></div>
       ${items.map(([k, l]) => `<a href="#/dashboard${k === 'overview' ? '' : '/' + k}" class="${S.page === k ? 'on' : ''}"${S.page === k ? ' aria-current="page"' : ''}>${l}</a>`).join('')}
       <div class="side-foot"><span class="stat"><i class="dot ${s.cls}"></i>${s.cls === 'on' ? 'Running' : s.text} · ${esc(modelLabel(st))}</span>
       <span>Profile: ${esc(profileName(st))} · all local</span></div></nav>`;
@@ -340,7 +349,7 @@
     const off = d.privacy ? d.privacy.apps_kept_off || 0 : 0;
     const paused = isPaused(st);
     return `<main class="fly">
-      <div class="f-head"><span class="logo">C</span>
+      <div class="f-head">${MARK}
         <div class="who"><span class="name">CaseComplete</span><span class="line" title="${esc(line)}"><i class="dot ${s.cls}"></i>${esc(line)}</span></div>
         <button class="sw" role="switch" aria-checked="${!!st.enabled}" aria-label="Enabled" data-act="enabled"></button></div>
       <div class="f-stats">

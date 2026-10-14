@@ -1,6 +1,7 @@
 /* CaseComplete local UI. Dark dashboard (#/dashboard), light flyout (#/flyout). */
 :root {
   --accent: #3A7BD5;
+  --ghost: #9A9DA3;
   --sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
   --display: 'Space Grotesk', 'IBM Plex Sans', system-ui, sans-serif;
   --mono: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
@@ -42,11 +43,7 @@ h1, h2 { margin: 0; }
 .empty { color: var(--muted); font-size: 13px; padding: 14px 0; }
 
 /* shared pieces */
-.logo {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; border-radius: 8px; flex: none;
-  background: var(--accent); color: #fff; font: 600 16px var(--display);
-}
+.logo { display: block; width: 30px; height: 30px; flex: none; }
 .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
 .dot.on { background: var(--good); }
 .dot.paused { background: var(--warn); }
@@ -141,8 +138,10 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
   border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px;
   position: sticky; top: 0; height: 100vh;
 }
-.side .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 18px; font: 600 15px var(--display); }
-.side .brand .logo { width: 28px; height: 28px; border-radius: 7px; font-size: 14px; }
+.side .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 18px; min-height: 54px; font: 600 15px var(--display); }
+.side .brand .logo { width: 28px; height: 28px; }
+.side .brand .wm { display: flex; flex-direction: column; line-height: 1.15; }
+.tagline { font: 400 12px var(--sans); color: var(--ghost); }
 .side a { padding: 9px 10px; border-radius: 8px; color: var(--muted); font-size: 14px; }
 .side a:hover { text-decoration: none; background: #15181c; }
 .side a.on { background: var(--sel); color: var(--strong); font-weight: 500; }
@@ -261,7 +260,7 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
 @media (max-width: 1000px) {
   .dash { flex-direction: column; }
   .side { width: auto; height: auto; position: static; flex-direction: row; flex-wrap: wrap; align-items: center; }
-  .side .brand { padding: 4px 8px; }
+  .side .brand { padding: 4px 8px; min-height: 0; }
   .side-foot { display: none; }
   .main { padding: 16px; }
   .main > * { grid-column: span 12 !important; }
