@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
-windows.workspace = true
+# Foundation_Numerics gates ID2D1RenderTarget::CreateSolidColorBrush in windows 0.58.
+windows = { workspace = true, features = ["Foundation_Numerics"] }
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
