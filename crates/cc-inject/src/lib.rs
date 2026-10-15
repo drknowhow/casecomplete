@@ -10,7 +10,9 @@
 //!   recognise them (in addition to LLKHF_INJECTED).
 
 use anyhow::{bail, Result};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, VkKeyScanExW, HKL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetKeyState, GetKeyboardLayout, VkKeyScanExW, HKL, VK_CAPITAL, VK_LWIN, VK_RWIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY,
@@ -64,9 +66,11 @@ pub fn backspace_slow(n: usize, gap: std::time::Duration) -> anyhow::Result<()> 
 /// everything in one burst.
 pub fn type_text_keys(text: &str, gap: std::time::Duration) -> anyhow::Result<()> {
     let layout = foreground_layout();
+    let live = live_state();
     let mut batch: Vec<INPUT> = Vec::new();
     for ch in text.chars() {
-        let records = key_inputs_for_char(ch, layout);
+        // SAFETY: VkKeyScanExW has no preconditions.
+        let records = char_inputs(ch, |unit| unsafe { VkKeyScanExW(unit, layout) }, live);
         if gap.is_zero() {
             batch.extend(records);
         } else {
@@ -89,8 +93,36 @@ fn foreground_layout() -> HKL {
     }
 }
 
+/// Keyboard state that changes what a real key press types.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Live {
+    caps_lock: bool,
+    /// Shift, Ctrl, Alt or Win is physically held.
+    modifier_held: bool,
+}
+
+fn live_state() -> Live {
+    // SAFETY: GetKeyState has no preconditions.
+    let caps_lock = unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0;
+    Live { caps_lock, modifier_held: key_held(VK_SHIFT) || shortcut_modifier_held() }
+}
+
+fn key_held(vk: VIRTUAL_KEY) -> bool {
+    // SAFETY: GetAsyncKeyState has no preconditions.
+    unsafe { GetAsyncKeyState(i32::from(vk.0)) < 0 }
+}
+
+/// Ctrl, Alt or Win is physically held, so an injected Backspace would delete a whole word
+/// and an injected letter would fire a shortcut.
+pub fn shortcut_modifier_held() -> bool {
+    [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN].into_iter().any(key_held)
+}
+
 /// Records for one character: modifiers down, key down/up, modifiers up; or a unicode pair.
-fn key_inputs_for_char(ch: char, layout: HKL) -> Vec<INPUT> {
+/// `scan` is `VkKeyScanEx` under the target's layout. A held modifier would change what the
+/// key types and Caps Lock would flip a letter's case, so in those states the character goes
+/// as a unicode packet, which neither affects.
+pub(crate) fn char_inputs(ch: char, scan: impl Fn(u16) -> i16, live: Live) -> Vec<INPUT> {
     if ch == '\n' {
         return vec![vk_event(VK_RETURN.0, false, false), vk_event(VK_RETURN.0, true, false)];
     }
@@ -99,11 +131,11 @@ fn key_inputs_for_char(ch: char, layout: HKL) -> Vec<INPUT> {
     }
     let mut units = [0u16; 2];
     let encoded = ch.encode_utf16(&mut units);
-    if encoded.len() != 1 {
+    let cased = ch.is_lowercase() || ch.is_uppercase();
+    if encoded.len() != 1 || live.modifier_held || (live.caps_lock && cased) {
         return encoded.iter().flat_map(|u| [unicode_event(*u, false), unicode_event(*u, true)]).collect();
     }
-    // SAFETY: VkKeyScanExW has no preconditions.
-    let scan = unsafe { VkKeyScanExW(encoded[0], layout) };
+    let scan = scan(encoded[0]);
     if scan == -1 {
         return vec![unicode_event(encoded[0], false), unicode_event(encoded[0], true)];
     }
@@ -370,6 +402,47 @@ mod tests {
 
     fn is_unicode(flags: u32) -> bool {
         flags & KEYEVENTF_UNICODE.0 != 0
+    }
+
+    fn scan_qwerty(unit: u16) -> i16 {
+        match char::from_u32(u32::from(unit)) {
+            Some(c @ 'a'..='z') => c.to_ascii_uppercase() as i16,
+            Some(c @ 'A'..='Z') => 0x100 | c as i16,
+            Some('1') => 0x31,
+            _ => -1,
+        }
+    }
+
+    #[test]
+    fn char_inputs_use_real_keys_when_nothing_interferes() {
+        let f: Vec<_> = char_inputs('a', scan_qwerty, Live::default()).iter().map(fields).collect();
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].0, is_up(f[0].2)), (b'A' as u16, false));
+        assert_eq!((f[1].0, is_up(f[1].2)), (b'A' as u16, true));
+        let f: Vec<_> = char_inputs('A', scan_qwerty, Live::default()).iter().map(fields).collect();
+        let vks: Vec<_> = f.iter().map(|x| (x.0, is_up(x.2))).collect();
+        assert_eq!(vks, [(VK_SHIFT.0, false), (b'A' as u16, false), (b'A' as u16, true), (VK_SHIFT.0, true)]);
+    }
+
+    #[test]
+    fn char_inputs_switch_letters_to_unicode_under_caps_lock() {
+        let caps = Live { caps_lock: true, modifier_held: false };
+        for ch in ['a', 'A'] {
+            let f: Vec<_> = char_inputs(ch, scan_qwerty, caps).iter().map(fields).collect();
+            assert_eq!(f.len(), 2, "{ch}");
+            assert!(f.iter().all(|x| is_unicode(x.2) && x.1 == ch as u16), "{ch}");
+        }
+        let f: Vec<_> = char_inputs('1', scan_qwerty, caps).iter().map(fields).collect();
+        assert!(f.iter().all(|x| !is_unicode(x.2) && x.0 == 0x31));
+    }
+
+    #[test]
+    fn char_inputs_switch_everything_to_unicode_while_a_modifier_is_held() {
+        let held = Live { caps_lock: false, modifier_held: true };
+        for ch in ['a', 'A', '1'] {
+            let f: Vec<_> = char_inputs(ch, scan_qwerty, held).iter().map(fields).collect();
+            assert!(f.iter().all(|x| is_unicode(x.2) && x.1 == ch as u16), "{ch}");
+        }
     }
 
     #[test]
