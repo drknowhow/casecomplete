@@ -75,6 +75,8 @@ pub struct ContextSnapshot {
 /// A change the UI asks the orchestrator to make.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiCommand {
+    /// Open the dashboard window at this page ("" = overview, "log", "settings", "words"...).
+    OpenDashboard(String),
     SetEnabled(bool),
     PauseMinutes(u32),
     SetAutoFixLevel(String),

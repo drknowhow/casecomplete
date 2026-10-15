@@ -123,9 +123,12 @@ input[type="range"] { accent-color: var(--accent); width: 100%; margin: 0; }
   display: flex; justify-content: space-between; align-items: center; gap: 12px;
   padding: 11px 14px; color: var(--text); font-size: 14px; border-bottom: 1px solid #ECECE9;
 }
-.f-rows a:last-child { border-bottom: 0; }
-.f-rows a:hover { background: #FAFAF8; text-decoration: none; border-radius: inherit; }
-.f-rows a span:last-child { color: var(--muted); text-align: right; }
+.f-rows a:last-child, .f-rows button:last-child { border-bottom: 0; }
+.f-rows a:hover, .f-rows button:hover { background: #FAFAF8; text-decoration: none; border-radius: inherit; }
+.f-rows a span:last-child, .f-rows button span:last-child { color: var(--muted); text-align: right; }
+.f-rows button { all: unset; box-sizing: border-box; width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 11px 14px; font: inherit; font-size: 14px; color: var(--ink); border-bottom: 1px solid var(--line); cursor: pointer; }
+.f-foot .links .link { all: unset; cursor: pointer; color: var(--accent); font: inherit; font-size: 13px; }
+.f-foot .links .link:hover { text-decoration: underline; }
 .f-foot { margin-top: auto; display: flex; justify-content: space-between; align-items: center; font-size: 13px; gap: 10px; }
 .f-foot .links { display: flex; gap: 14px; }
 .f-foot .quit { color: var(--muted); background: none; border: 0; padding: 0; }

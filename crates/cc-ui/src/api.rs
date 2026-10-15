@@ -17,7 +17,7 @@ const MAX_FIX_CHARS: usize = 128;
 const MAX_APPS: usize = 20;
 const KNOWN: &[&str] = &[
     "metrics", "series", "latency", "apps", "confidence", "events", "rules", "learned", "privacy",
-    "settings", "context", "words", "autocorrect", "quit", "open-profile",
+    "settings", "context", "words", "autocorrect", "quit", "open-profile", "open-dashboard",
 ];
 
 /// A failure with the HTTP status it maps to.
@@ -67,6 +67,17 @@ pub(crate) fn handle(ctx: &Ctx, req: &Req, name: &str) -> Reply {
         ("POST", "quit") => send(ctx, vec![UiCommand::Quit]).map(|()| json!({ "ok": true })),
         ("POST", "open-profile") => {
             send(ctx, vec![UiCommand::OpenProfileFolder]).map(|()| json!({ "ok": true }))
+        }
+        ("POST", "open-dashboard") => {
+            let page: String = json_body(req)
+                .ok()
+                .and_then(|b| b.get("page").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .take(32)
+                .collect();
+            send(ctx, vec![UiCommand::OpenDashboard(page)]).map(|()| json!({ "ok": true }))
         }
         (_, n) if KNOWN.contains(&n) => Err(ApiError::new(405, "method not allowed")),
         _ => Err(ApiError::new(404, "no such endpoint")),

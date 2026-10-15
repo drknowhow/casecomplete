@@ -361,11 +361,11 @@
       <div class="f-auto"><span class="f-label">Auto-fix</span>
         <div class="seg" role="group" aria-label="Auto-fix level">${LEVELS.map(([v, l]) => `<button data-act="level" data-v="${v}" aria-pressed="${st.auto_fix_level === v}">${l}</button>`).join('')}</div></div>
       <div class="f-rows">
-        <a href="#/dashboard/settings" target="_blank" rel="noopener"><span>Model</span><span>${esc(modelLabel(st))} ›</span></a>
-        <a href="#/dashboard/settings" target="_blank" rel="noopener"><span>Privacy</span><span>Off in ${off} app${off === 1 ? '' : 's'} ›</span></a>
-        <a href="#/dashboard/words" target="_blank" rel="noopener"><span>Your words</span><span>${fmt(learned)} learned ›</span></a></div>
+        <button type="button" data-act="dashboard" data-v="settings"><span>Model</span><span>${esc(modelLabel(st))} ›</span></button>
+        <button type="button" data-act="dashboard" data-v="settings"><span>Privacy</span><span>Off in ${off} app${off === 1 ? '' : 's'} ›</span></button>
+        <button type="button" data-act="dashboard" data-v="words"><span>Your words</span><span>${fmt(learned)} learned ›</span></button></div>
       <div class="f-foot"><button class="btn" data-act="pause">${paused ? 'Resume' : 'Pause 10 min'}</button>
-        <div class="links"><a href="#/dashboard" target="_blank" rel="noopener">Dashboard</a><a href="#/dashboard/log" target="_blank" rel="noopener">Log</a><button class="quit" data-act="quit">Quit</button></div></div>
+        <div class="links"><button type="button" class="link" data-act="dashboard" data-v="">Dashboard</button><button type="button" class="link" data-act="dashboard" data-v="log">Log</button><button class="quit" data-act="quit">Quit</button></div></div>
     </main>`;
   }
 
@@ -605,6 +605,10 @@
       load();
     },
     'log-kind': (el) => { S.logKind = el.dataset.v; load(); },
+    // The flyout lives in its own WebView2 window, so the dashboard opens through the app.
+    dashboard: async (el) => {
+      try { await post('open-dashboard', { page: el.dataset.v || '' }); } catch (_) { /* toasted */ }
+    },
     'open-profile': async () => {
       try { await post('open-profile'); toast('Opening the profile folder…'); } catch (_) { /* toasted */ }
     },

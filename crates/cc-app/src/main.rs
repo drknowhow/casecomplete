@@ -351,6 +351,11 @@ impl App {
                 self.push_ui_settings();
             }
             UiCommand::OpenProfileFolder => self.on_tray(TrayEvent::OpenProfileFolder),
+            UiCommand::OpenDashboard(page) => {
+                self.windows.close_flyout();
+                let view = if page.is_empty() { "dashboard".to_string() } else { format!("dashboard/{page}") };
+                self.windows.open_dashboard(&self.ui.url(&view));
+            }
             UiCommand::Quit => self.on_tray(TrayEvent::Quit),
         }
     }
