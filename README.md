@@ -8,6 +8,7 @@
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-17191C?style=flat-square"></a>
   <img alt="Windows" src="https://img.shields.io/badge/platform-Windows%2011-17191C?style=flat-square">
   <img alt="Local" src="https://img.shields.io/badge/runs-100%25%20local-2E8B57?style=flat-square">
+  <a href="https://github.com/sponsors/drknowhow"><img alt="Sponsor" src="https://img.shields.io/badge/sponsor-%E2%9D%A4-F0A35E?style=flat-square"></a>
 </p>
 
 <p align="center">
@@ -107,6 +108,10 @@ Design notes: [research and architecture](docs/research-and-architecture.md), [p
 - Tier-2 sentence rewrite on a pause, suggest-only
 - Fine-tuning the completion model on your own writing (LoRA), locally
 - A bench on your own text to pick the model that knows your voice
+
+## Support the project
+
+CaseComplete is free and will stay free. If it saves you time every day, you can [sponsor the work on GitHub](https://github.com/sponsors/drknowhow); it pays for the hardware the models are tested on and keeps the releases coming.
 
 ## Contributing
 
