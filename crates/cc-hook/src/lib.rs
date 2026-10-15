@@ -1,4 +1,5 @@
-//! Low-level keyboard hook (WH_KEYBOARD_LL) on a dedicated thread.
+//! Low-level keyboard hook (WH_KEYBOARD_LL) on a dedicated thread, plus a mouse hook that
+//! only reports button presses (a click can move the caret behind the shadow buffer's back).
 //!
 //! Contract (see docs/PLAN.md §2):
 //! - The hook callback ONLY classifies the key, consults [`SwallowState`], and sends a
@@ -38,8 +39,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, KBDLLHOOKSTRUCT,
-    LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN,
-    WM_USER,
+    LLKHF_INJECTED, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_MBUTTONDOWN, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_USER,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,8 @@ pub enum HookEvent {
     /// A text key swallowed while `SwallowState::capture` was set; the orchestrator must
     /// replay it after its own injection. '\u{8}' is Backspace, '\n' is Enter.
     Captured(char),
+    /// A mouse button went down: the caret may have moved or another field taken focus.
+    Click,
     /// Non-text key we do not model (Ctrl+C etc.). Carries the virtual-key code.
     Other(u32),
 }
@@ -73,6 +76,12 @@ pub struct SwallowState {
     /// While set, text keys are swallowed and reported as `Captured` so they cannot
     /// interleave with an injection in progress.
     pub capture: AtomicBool,
+    /// Keys reported as `Captured` so far. Counted before sending, so a key still on its
+    /// way to the orchestrator shows up here first.
+    pub captured: AtomicU64,
+    /// Keys and clicks let through while `capture` was set (arrows, shortcuts, mouse
+    /// buttons): each may have moved the caret or changed the text under an injection.
+    pub passed: AtomicU64,
 }
 
 impl SwallowState {
@@ -84,6 +93,12 @@ impl SwallowState {
     }
     pub fn set_capture(&self, v: bool) {
         self.capture.store(v, Ordering::SeqCst);
+    }
+    pub fn captured(&self) -> u64 {
+        self.captured.load(Ordering::SeqCst)
+    }
+    pub fn passed(&self) -> u64 {
+        self.passed.load(Ordering::SeqCst)
     }
 }
 
@@ -150,14 +165,31 @@ pub fn now_ms() -> u64 {
 #[derive(Debug, Default, Clone)]
 pub struct ShadowBuffer {
     text: String,
+    /// The text starts where the field's text starts, so its first word is a whole word.
+    /// False when the caret sits after text we have not seen.
+    anchored: bool,
 }
 
 impl ShadowBuffer {
     pub fn new() -> Self { Self::default() }
-    pub fn reset(&mut self, text: &str) { self.text = text.to_string(); }
+    /// Everything before the caret, as read from the field.
+    pub fn reset(&mut self, text: &str) {
+        self.text = text.to_string();
+        self.anchored = true;
+    }
+    /// The caret is somewhere in text we have not seen.
+    pub fn reset_unknown(&mut self) {
+        self.text.clear();
+        self.anchored = false;
+    }
     pub fn push(&mut self, ch: char) { self.text.push(ch); }
-    pub fn backspace(&mut self) { self.text.pop(); }
+    pub fn backspace(&mut self) {
+        if self.text.pop().is_none() {
+            self.anchored = false;
+        }
+    }
     pub fn text(&self) -> &str { &self.text }
+    pub fn anchored(&self) -> bool { self.anchored }
     /// Characters after the last whitespace (the partial word being typed).
     pub fn current_word(&self) -> &str {
         // `char_indices` + `len_utf8` so multi-byte whitespace (e.g. U+00A0) cannot split a char.
@@ -323,13 +355,19 @@ fn hook_thread(
                 return;
             }
         };
+        let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0)
+            .inspect_err(|e| log::warn!("cc-hook: mouse hook not installed, clicks go unnoticed: {e}"))
+            .ok();
         let _ = ready.send(Ok(GetCurrentThreadId()));
 
-        // The hook procedure is invoked from inside GetMessageW. 0 = WM_QUIT, -1 = error.
+        // The hook procedures are invoked from inside GetMessageW. 0 = WM_QUIT, -1 = error.
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {}
 
         if let Err(e) = UnhookWindowsHookEx(hook) {
             log::warn!("cc-hook: UnhookWindowsHookEx failed: {e}");
+        }
+        if let Some(mouse) = mouse {
+            let _ = UnhookWindowsHookEx(mouse);
         }
     }
     CTX.with(|c| *c.borrow_mut() = None);
@@ -348,6 +386,42 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
     }
     // SAFETY: forwarding the unchanged arguments; no locks or borrows are held here.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Reports button presses only; moves and wheel turns pass untouched.
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 && matches!(wparam.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+        CTX.with(|cell| {
+            if let Ok(guard) = cell.try_borrow() {
+                if let Some(ctx) = guard.as_ref() {
+                    if ctx.swallow.capture.load(Ordering::SeqCst) {
+                        ctx.swallow.passed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = ctx.tx.try_send(HookEvent::Click);
+                }
+            }
+        });
+    }
+    // SAFETY: forwarding the unchanged arguments; no locks or borrows are held here.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+/// Sends a typed character: as `Captured` while capturing, else as `Char`.
+fn send_char(ctx: &HookCtx, c: char, capture: bool) {
+    if capture {
+        ctx.swallow.captured.fetch_add(1, Ordering::SeqCst);
+        let _ = ctx.tx.try_send(HookEvent::Captured(c));
+    } else {
+        let _ = ctx.tx.try_send(HookEvent::Char(c));
+    }
+}
+
+fn is_modifier(vk: u32) -> bool {
+    use vk::*;
+    matches!(
+        vk,
+        SHIFT | LSHIFT | RSHIFT | CONTROL | LCONTROL | RCONTROL | MENU | LMENU | RMENU | LWIN | RWIN | CAPITAL
+    )
 }
 
 fn accept_injected() -> bool {
@@ -385,15 +459,20 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         let capture = ctx.swallow.capture.load(Ordering::SeqCst);
         match ev {
             Some(HookEvent::Backspace) if capture => {
-                let _ = ctx.tx.try_send(HookEvent::Captured('\u{8}'));
+                send_char(ctx, '\u{8}', true);
                 return true;
             }
             Some(HookEvent::Enter) if capture => {
-                let _ = ctx.tx.try_send(HookEvent::Captured('\n'));
+                send_char(ctx, '\n', true);
                 return true;
             }
             _ => {}
         }
+        let passes = |ctx: &HookCtx| {
+            if capture && !is_modifier(vk) {
+                ctx.swallow.passed.fetch_add(1, Ordering::SeqCst);
+            }
+        };
 
         // Text keys (decide() says Other), plus Ctrl+Alt+Z, which on AltGr layouts can be a
         // real character (e.g. Polish AltGr+Z) and must not be eaten as a revert.
@@ -406,19 +485,22 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
             // the target app receives, so read the unit directly instead.
             if vk == vk::PACKET {
                 if let Some(c) = char::from_u32(kb.scanCode) {
-                    let _ = ctx.tx.try_send(if capture { HookEvent::Captured(c) } else { HookEvent::Char(c) });
+                    send_char(ctx, c, capture);
                 }
                 return capture;
             }
             match translate(vk, kb.scanCode) {
                 Translation::Text(buf) => {
                     for &c in &buf.chars[..buf.len] {
-                        let _ = ctx.tx.try_send(if capture { HookEvent::Captured(c) } else { HookEvent::Char(c) });
+                        send_char(ctx, c, capture);
                     }
                     return capture;
                 }
                 // Dead key: let the app compose it; the orchestrator sees nothing.
-                Translation::Dead => return false,
+                Translation::Dead => {
+                    passes(ctx);
+                    return false;
+                }
                 Translation::NoText => {}
             }
         }
@@ -426,6 +508,9 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         if let Some(e) = ev {
             // Drop on full: the hook must never block.
             let _ = ctx.tx.try_send(e);
+        }
+        if !swallow {
+            passes(ctx);
         }
         swallow
     })
@@ -671,6 +756,23 @@ mod tests {
     }
 
     #[test]
+    fn anchoring_follows_what_is_known_before_the_caret() {
+        let mut b = ShadowBuffer::new();
+        assert!(!b.anchored());
+        b.reset("");
+        assert!(b.anchored());
+        b.push('a');
+        b.backspace();
+        assert!(b.anchored());
+        b.backspace();
+        assert!(!b.anchored(), "deleting past the start reaches unseen text");
+        b.reset("some text");
+        assert!(b.anchored());
+        b.reset_unknown();
+        assert_eq!((b.text(), b.anchored()), ("", false));
+    }
+
+    #[test]
     fn backspace_removes_one_whole_char() {
         let mut b = buf("ab😀");
         b.backspace();
@@ -778,6 +880,38 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(E::Left));
         assert!(!feed(WM_KEYDOWN, &back));
         assert_eq!(rx.try_recv(), Ok(E::Backspace));
+    }
+
+    #[test]
+    fn proc_counts_captured_keys_and_keys_let_through_while_capturing() {
+        let (rx, swallow) = install_ctx();
+        swallow.set_capture(true);
+        assert!(feed(WM_KEYDOWN, &kb(vk::BACK, 0, 0)));
+        assert_eq!(rx.try_recv(), Ok(E::Captured('\u{8}')));
+        assert_eq!(swallow.captured(), 1);
+        assert!(!feed(WM_KEYDOWN, &kb(vk::DOWN, 0, 0)));
+        assert_eq!(rx.try_recv(), Ok(E::Nav));
+        assert!(!feed(WM_KEYDOWN, &kb(vk::SHIFT, 0, 0)));
+        assert_eq!(swallow.passed(), 1, "a modifier alone changes nothing");
+        swallow.set_capture(false);
+        assert!(!feed(WM_KEYDOWN, &kb(vk::DOWN, 0, 0)));
+        assert_eq!((swallow.captured(), swallow.passed()), (1, 1));
+    }
+
+    #[test]
+    fn mouse_proc_reports_button_presses_only() {
+        const WM_MOUSEMOVE: u32 = 0x0200;
+        let (rx, swallow) = install_ctx();
+        let click = |msg: u32| unsafe { mouse_proc(HC_ACTION as i32, WPARAM(msg as usize), LPARAM(0)) };
+        click(WM_MOUSEMOVE);
+        assert!(rx.try_recv().is_err());
+        click(WM_LBUTTONDOWN);
+        assert_eq!(rx.try_recv(), Ok(E::Click));
+        assert_eq!(swallow.passed(), 0);
+        swallow.set_capture(true);
+        click(WM_RBUTTONDOWN);
+        assert_eq!(rx.try_recv(), Ok(E::Click));
+        assert_eq!(swallow.passed(), 1);
     }
 
     #[test]

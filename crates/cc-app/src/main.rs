@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
 
 mod autostart;
+mod fixgate;
 mod privacy;
 use privacy::Policy;
 
@@ -99,6 +100,14 @@ struct Fix {
     event_id: i64,
 }
 
+/// A fix to compare against the field once its keys have landed (UIA fields only).
+#[derive(Clone, Copy)]
+struct FixCheck {
+    hwnd: isize,
+    due: Instant,
+    give_up: Instant,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Settings {
     enabled: bool,
@@ -152,6 +161,8 @@ struct App {
     prev_boundary: Option<(String, usize)>,
     auto_level: Option<Severity>,
     last_fix: Option<Fix>,
+    fix_check: Option<FixCheck>,
+    breaker: fixgate::Breaker,
     store: Store,
     tray: Tray,
     profile: PathBuf,
@@ -194,6 +205,12 @@ struct App {
     /// Keys the hook swallowed during an injection, replayed once the channel has drained.
     replay: String,
     replay_at: Option<Instant>,
+    /// `Captured` events received; capture ends only when this matches the hook's count.
+    captured_seen: u64,
+    /// Capture ends by then even if a captured key never arrived.
+    capture_deadline: Option<Instant>,
+    /// A click may have moved the caret: re-read the field once it has landed.
+    resync_at: Option<Instant>,
     dont_touch: HashSet<String>,
     reverts: HashMap<String, u32>,
     shadow: ShadowBuffer,
@@ -381,14 +398,23 @@ impl App {
         self.cancel_ghost();
         self.pending = false;
         if self.in_terminal {
-            self.shadow.reset("");
+            self.shadow.reset_unknown();
             return;
         }
         if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
             self.shadow.reset(&t);
         } else {
-            self.shadow.reset("");
+            self.shadow.reset_unknown();
         }
+    }
+
+    /// Forgets the shadow now and re-reads the field shortly, once the event that moved the
+    /// caret has reached the app.
+    fn resync_soon(&mut self) {
+        self.cancel_ghost();
+        self.shadow.reset_unknown();
+        self.prev_boundary = None;
+        self.resync_at = Some(Instant::now() + Duration::from_millis(150));
     }
 
     fn field_allowed(&mut self) -> bool {
@@ -402,7 +428,7 @@ impl App {
                     self.last_exe = fi.exe.clone();
                     self.last_hwnd = fi.hwnd;
                     // A different window means the shadow buffer describes the wrong field.
-                    self.shadow.reset("");
+                    self.shadow.reset_unknown();
                 }
                 self.in_terminal = TERMINAL_EXES.contains(&fi.exe.as_str());
                 if let Some(why) = self.policy.denies(&fi.exe, &cc_context::window_title()) {
@@ -544,8 +570,12 @@ impl App {
     /// in chat fields the text has already been sent.
     fn on_word_boundary(&mut self, boundary: char) {
         let Some(level) = self.auto_level.clone() else { return };
+        if self.breaker.paused(self.last_hwnd, Instant::now()) {
+            return;
+        }
         let text = self.shadow.text();
         let body = &text[..text.len() - boundary.len_utf8()];
+        let body_len = body.len();
         let start = body.rfind(|c| matches!(c, '.' | '!' | '?' | '\n')).map_or(0, |i| i + 1);
         let sentence = body[start..].trim_start().to_string();
         let word = sentence.rsplit(char::is_whitespace).next().unwrap_or("").to_string();
@@ -586,12 +616,35 @@ impl App {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
         };
+        // The fix deletes `original` back from the caret. Unless the shadow saw what precedes
+        // it, that may be the tail of a longer word, and the result would be a mangled word.
+        let whole_word = body_len > c.original.len() || self.shadow.anchored();
+        let taught = c.rule == "autocorrect" && self.auto.is_user_entry(&word);
+        let is_word = |token: &str| taught || self.checker.is_word(token, &self.dict);
+        if let Some(why) = fixgate::reject(&c.original, &c.replacement, whole_word, is_word) {
+            log::info!("fix {:?} -> {:?} [{}] not applied: {why}", c.original, c.replacement, c.rule);
+            self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+            return;
+        }
+        let check_ms = t0.elapsed().as_millis() as u32;
         log::info!(
             "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
-            c.original, c.replacement, c.rule, c.severity, c.confidence, t0.elapsed().as_millis()
+            c.original, c.replacement, c.rule, c.severity, c.confidence, check_ms
         );
         self.prev_boundary = None;
         self.cancel_ghost();
+        let caret = cc_context::caret_rect();
+        let mut typed = c.replacement.clone();
+        typed.push(boundary);
+        let del = c.original.chars().count() + 1;
+        if !self.replace_tail(del, &typed) {
+            return;
+        }
+        if !self.in_terminal {
+            let now = Instant::now();
+            let due = now + inject_settle(del + typed.chars().count());
+            self.fix_check = Some(FixCheck { hwnd: self.last_hwnd, due, give_up: now + Duration::from_secs(3) });
+        }
         let event_id = self
             .store
             .log(&NewEvent {
@@ -607,18 +660,12 @@ impl App {
                 original: c.original.clone(),
                 replacement: c.replacement.clone(),
                 action: Action::Auto,
-                latency_ms: t0.elapsed().as_millis() as u32,
+                latency_ms: check_ms,
             })
             .unwrap_or_else(|e| {
                 log::warn!("store log failed: {e:#}");
                 0
             });
-        let caret = cc_context::caret_rect();
-        let mut typed = c.replacement.clone();
-        typed.push(boundary);
-        if !self.replace_tail(c.original.chars().count() + 1, &typed) {
-            return;
-        }
         if let Some(r) = caret {
             let w = (typed.chars().count() as f32 * self.style.font_px * 0.55) as i32;
             self.overlay.show_underline(cc_overlay::Rect { x: r.x - w, y: r.y, w, h: r.h }, UNDERLINE_FADE_MS);
@@ -638,7 +685,7 @@ impl App {
         if now_len > prev_len || prev == word || prev.chars().count() < 3 || word.chars().count() < 2 {
             return;
         }
-        if cc_correct::is_code_like(&prev) || cc_correct::is_code_like(word) {
+        if cc_correct::is_code_like(&prev) || cc_correct::is_code_like(word) || !self.checker.is_word(word, &self.dict) {
             return;
         }
         if cc_correct::edit_distance(&prev.to_lowercase(), &word.to_lowercase()) > 2 {
@@ -661,7 +708,21 @@ impl App {
         // Capture the user's keys for the duration, and let the boundary key that triggered
         // us settle in the target before deleting behind it.
         self.swallow.set_capture(true);
+        let passed = self.swallow.passed();
         std::thread::sleep(Duration::from_millis(fix_pre_delay_ms()));
+        // Ctrl, Alt or Win held would turn Backspace into delete-word or a shortcut, and a key
+        // or click that got past the capture may have moved the caret: either way the planned
+        // edit no longer matches the field. Ctrl+Alt+Z (revert) is usually still being
+        // released here, so give the modifiers a moment.
+        let wait_until = Instant::now() + Duration::from_millis(500);
+        while cc_inject::shortcut_modifier_held() && self.swallow.passed() == passed && Instant::now() < wait_until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if cc_inject::shortcut_modifier_held() || self.swallow.passed() != passed {
+            log::info!("fix not applied: a shortcut key is held or the caret may have moved");
+            self.end_capture();
+            return false;
+        }
         let result = match fix_inject_mode().as_str() {
             "fast" => cc_inject::backspace(del).and_then(|_| cc_inject::type_text(typed)),
             "paste" => cc_inject::backspace_slow(del, gap).and_then(|_| cc_inject::paste_text(typed)),
@@ -689,11 +750,60 @@ impl App {
         true
     }
 
-    /// Stops capturing; captured keys are replayed on a later tick, once the hook thread has
-    /// delivered all of them.
+    /// Captured keys are replayed on a later tick, once the hook thread has delivered them.
+    /// Capture stays on until then, so a key typed meanwhile cannot overtake them.
     fn end_capture(&mut self) {
+        let now = Instant::now();
+        self.replay_at = Some(now + Duration::from_millis(30));
+        self.capture_deadline.get_or_insert(now + Duration::from_secs(1));
+    }
+
+    /// Ends the capture once every captured key has arrived and been replayed.
+    fn release_capture(&mut self) {
+        let now = Instant::now();
+        let all_in = self.captured_seen == self.swallow.captured() && self.replay.is_empty();
+        let overdue = self.capture_deadline.is_some_and(|t| now >= t);
+        if !all_in && !overdue {
+            self.replay_at = Some(now + Duration::from_millis(5));
+            return;
+        }
+        if !all_in {
+            log::warn!("capture released with captured keys still missing");
+            self.captured_seen = self.swallow.captured();
+            if !self.replay.is_empty() {
+                self.replay_at = Some(now);
+            }
+        }
         self.swallow.set_capture(false);
-        self.replay_at = Some(Instant::now() + Duration::from_millis(30));
+        self.capture_deadline = None;
+    }
+
+    /// A fix was undone. Twice in quick succession in one window means the shadow buffer and
+    /// the field disagree: auto-fix pauses there instead of compounding the damage.
+    fn note_undo(&mut self) {
+        if self.breaker.undone(self.last_hwnd, Instant::now()) {
+            log::warn!("auto-fix paused for {}s in {}: two fixes undone in a row", fixgate::PAUSE.as_secs(), self.last_exe);
+            self.tray.set_status("Auto-fix paused here for a minute: two fixes in a row were undone");
+            self.resync_soon();
+        }
+    }
+
+    /// The field must end with what the shadow buffer says was typed. If it does not, a fix
+    /// went somewhere else: auto-fix pauses in this window and the field's text is taken as
+    /// the truth.
+    fn verify_field(&mut self, hwnd: isize) {
+        let Some(field) = cc_context::text_before_caret(CONTEXT_CHARS) else { return };
+        if fixgate::same_tail(&field, self.shadow.text()) {
+            return;
+        }
+        log::warn!(
+            "fix check failed in {}: the field does not end with the typed text; auto-fix paused for {}s",
+            self.last_exe,
+            fixgate::PAUSE.as_secs()
+        );
+        self.breaker.trip(hwnd, Instant::now());
+        self.tray.set_status("Auto-fix paused here for a minute: a fix did not land as expected");
+        self.shadow.reset(&field);
     }
 
     fn flush_replay(&mut self) {
@@ -741,6 +851,7 @@ impl App {
         }
         self.pending_fix_event = None;
         self.outcome(fix.event_id, Outcome::Reverted);
+        self.note_undo();
         self.dont_touch.insert(fix.original.clone());
         self.auto.remove(&fix.original);
         if let Err(e) = self.auto.save(&self.auto_path) {
@@ -751,8 +862,16 @@ impl App {
 
     fn on_key(&mut self, ev: HookEvent) {
         log::trace!("key {ev:?} ghost_visible={} ghost={:?}", self.ghost_visible, self.ghost);
+        if let HookEvent::Captured(c) = ev {
+            // The hook swallowed it, so it is replayed even while paused.
+            self.captured_seen += 1;
+            self.replay.push(c);
+            return;
+        }
         if !self.active() {
+            // Keys typed while paused are not tracked, so the shadow no longer matches.
             self.cancel_ghost();
+            self.shadow.reset_unknown();
             return;
         }
         self.last_key = Instant::now();
@@ -764,7 +883,7 @@ impl App {
         match ev {
             HookEvent::Char(c) => {
                 self.shadow.push(c);
-                if c.is_whitespace() || c.is_ascii_punctuation() {
+                if fixgate::closes_word(c) {
                     self.on_word_boundary(c);
                     if self.last_fix.is_some() {
                         return;
@@ -789,6 +908,7 @@ impl App {
                     if self.shadow.text().chars().count() < len {
                         self.pending_fix_event = None;
                         self.outcome(id, Outcome::Overwritten);
+                        self.note_undo();
                     }
                 }
                 self.cancel_ghost();
@@ -805,7 +925,8 @@ impl App {
             HookEvent::Other(vk) if is_modifier_vk(vk) => {}
             HookEvent::Left | HookEvent::Right | HookEvent::Nav | HookEvent::Other(_) => self.resync(),
             HookEvent::RevertRequested => self.revert_fix(),
-            HookEvent::Captured(c) => self.replay.push(c),
+            HookEvent::Click => self.resync_soon(),
+            HookEvent::Captured(_) => {}
         }
     }
 
@@ -1113,6 +1234,24 @@ impl App {
             if Instant::now() >= at {
                 self.replay_at = None;
                 self.flush_replay();
+                if self.replay_at.is_none() {
+                    self.release_capture();
+                }
+            }
+        }
+        if let Some(check) = self.fix_check {
+            let now = Instant::now();
+            if now >= check.give_up || check.hwnd != self.last_hwnd {
+                self.fix_check = None;
+            } else if now >= check.due && self.last_key.elapsed() >= DEBOUNCE && self.replay_at.is_none() {
+                self.fix_check = None;
+                self.verify_field(check.hwnd);
+            }
+        }
+        if self.resync_at.is_some_and(|t| Instant::now() >= t) {
+            self.resync_at = None;
+            if self.field_allowed() {
+                self.resync();
             }
         }
         if self.pending && self.last_key.elapsed() >= DEBOUNCE {
@@ -1313,8 +1452,13 @@ fn start() -> anyhow::Result<()> {
         dict_path,
         auto_level,
         last_fix: None,
+        fix_check: None,
+        breaker: fixgate::Breaker::default(),
         replay: String::new(),
         replay_at: None,
+        captured_seen: 0,
+        capture_deadline: None,
+        resync_at: None,
         dont_touch: HashSet::new(),
         reverts: HashMap::new(),
         shadow: ShadowBuffer::new(),
