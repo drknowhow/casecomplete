@@ -31,7 +31,9 @@ pub struct CompletionClient {
 
 impl CompletionClient {
     pub fn new(base_url: &str) -> CompletionClient {
+        // llama-server is on loopback; never route it through the system proxy.
         let http = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(5))
             .tcp_nodelay(true)
             .build()

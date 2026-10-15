@@ -182,6 +182,7 @@ impl Sidecar {
         let base_url = format!("http://127.0.0.1:{port}");
         let health_url = format!("{base_url}/health");
         let http = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
             .context("building health-check client")?;

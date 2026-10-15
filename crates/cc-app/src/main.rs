@@ -28,6 +28,9 @@ use cc_store::{Action, NewEvent, Outcome, Source, Store};
 use cc_tray::{Tray, TrayEvent, TrayState};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use tokio_util::sync::CancellationToken;
+use windows::core::{w, HSTRING};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_ICONWARNING, MB_OK, MESSAGEBOX_STYLE};
 
 const PORT: u16 = 8089;
 const DEBOUNCE: Duration = Duration::from_millis(100);
@@ -1028,6 +1031,8 @@ impl App {
                     "Off"
                 } else if self.paused_until.is_some_and(|t| Instant::now() < t) {
                     "Paused"
+                } else if self.sidecar.is_none() {
+                    "Completions off (model not loaded)"
                 } else {
                     "Ready"
                 };
@@ -1160,7 +1165,36 @@ fn data_root() -> PathBuf {
     base.join("CaseComplete")
 }
 
-fn main() -> anyhow::Result<()> {
+/// A windowed app has no stderr, so an error returned from `main` would vanish without a
+/// trace: it is logged and shown in a message box instead.
+fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        default_hook(info);
+    }));
+    if let Err(e) = start() {
+        log::error!("fatal: {e:#}");
+        message_box(
+            &format!("CaseComplete could not start.\n\n{e:#}\n\nLog: {}", log_path().display()),
+            MB_ICONERROR,
+        );
+        std::process::exit(1);
+    }
+}
+
+fn log_path() -> PathBuf {
+    data_root().join("casecomplete.log")
+}
+
+fn message_box(text: &str, icon: MESSAGEBOX_STYLE) {
+    // SAFETY: plain Win32 call with valid strings and no owner window.
+    unsafe {
+        MessageBoxW(HWND::default(), &HSTRING::from(text), w!("CaseComplete"), MB_OK | icon);
+    }
+}
+
+fn start() -> anyhow::Result<()> {
     let root = data_root();
     std::fs::create_dir_all(&root)?;
     // A windowed app: no console unless CC_CONSOLE=1 asks for one; otherwise the log
@@ -1172,7 +1206,7 @@ fn main() -> anyhow::Result<()> {
             let _ = windows::Win32::System::Console::AllocConsole();
         }
     } else {
-        let path = root.join("casecomplete.log");
+        let path = log_path();
         if std::fs::metadata(&path).map_or(false, |m| m.len() > 5 << 20) {
             let _ = std::fs::remove_file(&path);
         }
@@ -1300,7 +1334,17 @@ fn main() -> anyhow::Result<()> {
         last_hwnd: 0,
         in_terminal: false,
     };
-    app.start_engine(&model_id).context("engine")?;
+    if let Err(e) = app.start_engine(&model_id) {
+        // Corrections need no model, so a failed download (blocked network, a proxy
+        // certificate we don't trust) turns completion off instead of ending the app.
+        log::error!("engine failed to start: {e:#}");
+        let text = format!(
+            "CaseComplete is running in the system tray, but completions are off because the model could not be loaded.\n\n{e:#}\n\nCorrections still work. Restart CaseComplete to try again.\n\nLog: {}",
+            log_path().display()
+        );
+        // On its own thread: a modal box here would stall the orchestrator.
+        std::thread::spawn(move || message_box(&text, MB_ICONWARNING));
+    }
     app.run_tuning();
     app.push_ui_settings();
     app.refresh_status(true);

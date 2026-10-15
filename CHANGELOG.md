@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 (2026-10-15)
+
+- A startup error is logged and shown in a message box instead of the app quitting without a word
+- If the first-run download fails, the app stays in the tray with completions off and says why; corrections keep working
+- Downloads trust the Windows certificate store and use the Windows proxy settings, so they work behind corporate TLS inspection
+
 ## 0.1.0 (2026-10-14)
 
 First public build.

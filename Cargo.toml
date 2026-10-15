@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*", "tools/bench"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
@@ -31,7 +31,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util"] }
 tokio-util = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# native-roots trusts the Windows certificate store (corporate TLS inspection) on top of the
+# bundled roots; system-proxy reads the Windows proxy settings.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"] }
 futures-util = "0.3"
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
