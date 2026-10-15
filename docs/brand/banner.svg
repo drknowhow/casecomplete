@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 360" width="1280" height="360" role="img" aria-label="CaseComplete. Just type.">
+  <rect width="1280" height="360" rx="24" fill="#121418"/>
+  <g transform="translate(96 108) scale(1.2)">
+    <rect x="6" y="10" width="108" height="104" rx="22" fill="#0C0E11"/>
+    <rect x="6" y="6" width="108" height="100" rx="22" fill="#3A7BD5"/>
+    <path d="M30 56 H78" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round"/>
+    <path d="M64 38 L84 56 L64 74" fill="none" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M92 36 V76" stroke="#FFFFFF" stroke-width="11" stroke-linecap="round"/>
+  </g>
+  <text x="296" y="178" font-family="Space Grotesk, Segoe UI, Helvetica, Arial, sans-serif" font-weight="700" font-size="72" fill="#FFFFFF" letter-spacing="-2">CaseComplete</text>
+  <text x="300" y="236" font-family="IBM Plex Sans, Segoe UI, Helvetica, Arial, sans-serif" font-weight="400" font-size="30" fill="#9A9DA3">Just type. Fixes your typos, finishes your sentences, learns how you write.</text>
+  <text x="300" y="282" font-family="IBM Plex Sans, Segoe UI, Helvetica, Arial, sans-serif" font-weight="500" font-size="22" fill="#3A7BD5">Windows  ·  100% local  ·  open source</text>
+</svg>

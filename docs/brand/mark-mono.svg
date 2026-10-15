@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="CaseComplete tray glyph">
+  <path d="M22 60 H80" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+  <path d="M62 36 L88 60 L62 84" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M100 34 V86" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+</svg>
