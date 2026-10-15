@@ -17,3 +17,4 @@
 /.cargo/config.toml
 /promo/node_modules/
 /promo/out/
+/tools/bench/results/
