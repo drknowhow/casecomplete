@@ -6,3 +6,14 @@
 *.log
 .env
 /installer/out/
+
+# local tooling and agent config, never published
+/.c3/
+/.claude/
+/.mcp.json
+/AGENTS.md
+/CLAUDE.md
+/.github/copilot-instructions.md
+/.cargo/config.toml
+/promo/node_modules/
+/promo/out/
