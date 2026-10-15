@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CaseComplete</title>
+<meta name="description" content="Just type. A Windows typing assistant that fixes your typos as you go, finishes your sentences, and learns how you write. 100% local.">
+<meta property="og:title" content="CaseComplete">
+<meta property="og:description" content="Just type. Fixes your typos, finishes your sentences, learns how you write. 100% local, open source.">
+<meta property="og:image" content="https://drknowhow.github.io/casecomplete/brand/social-preview.png">
+<meta property="og:type" content="website">
+<link rel="icon" href="brand/mark.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@600;700&display=swap">
+<style>
+  :root { --blue:#3A7BD5; --ink:#17191C; --ghost:#9A9DA3; --paper:#F7F7F5; --night:#121418; --tile:#1A1D22; --line:#2A2D33; --kept:#2E8B57; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--night); color:#E8E9EB; font-family:'IBM Plex Sans',system-ui,sans-serif; line-height:1.55; }
+  a { color:#7FB2F0; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 20px; }
+  header { display:flex; align-items:center; justify-content:space-between; padding: 22px 0; }
+  .brand { display:flex; align-items:center; gap:12px; font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:20px; color:#fff; text-decoration:none; }
+  .brand svg { width:30px; height:30px; }
+  nav a { color:#B6B9BF; text-decoration:none; margin-left: 22px; font-size:14px; }
+  nav a:hover { color:#fff; }
+  .hero { padding: 48px 0 24px; text-align:center; }
+  .hero h1 { font-family:'Space Grotesk',sans-serif; font-weight:700; font-size: clamp(40px, 7vw, 72px); letter-spacing:-0.02em; margin:0 0 14px; color:#fff; }
+  .hero p { font-size: 20px; color:#B6B9BF; max-width: 680px; margin: 0 auto 26px; }
+  .cta { display:inline-flex; align-items:center; gap:10px; background:var(--blue); color:#fff; text-decoration:none; font-weight:600; padding: 14px 22px; border-radius: 10px; font-size: 16px; }
+  .cta:hover { background:#2F6BC0; }
+  .sub { display:block; margin-top: 12px; font-size: 13px; color: var(--ghost); }
+  .video { margin: 36px auto 0; max-width: 960px; border-radius: 14px; overflow:hidden; border:1px solid var(--line); background:#000; box-shadow: 0 30px 80px rgba(0,0,0,.45); }
+  video { display:block; width:100%; height:auto; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin: 44px 0; }
+  .card { background:var(--tile); border-radius: 12px; padding: 18px 20px; }
+  .card h3 { margin:0 0 6px; font-size: 16px; font-weight: 600; color:#fff; }
+  .card p { margin:0; color:#B6B9BF; font-size: 14px; }
+  .kbd { display:inline-block; font-family:'IBM Plex Sans',sans-serif; font-size:12px; background:#2A2D33; border-radius:5px; padding:1px 7px; color:#fff; }
+  .privacy { background: var(--tile); border-radius: 14px; padding: 26px 28px; display:grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items:center; margin: 10px 0 44px; }
+  .privacy h2 { font-family:'Space Grotesk',sans-serif; margin:0 0 8px; font-size: 26px; color:#fff; }
+  .privacy ul { margin: 0; padding-left: 18px; color:#B6B9BF; font-size: 14px; }
+  footer { border-top: 1px solid var(--line); padding: 26px 0 40px; color: var(--ghost); font-size: 13px; display:flex; flex-wrap:wrap; gap: 16px; justify-content:space-between; }
+  @media (max-width: 720px) { .privacy { grid-template-columns: 1fr; } nav a { margin-left: 14px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="brand" href="./">
+      <svg viewBox="0 0 120 120" aria-hidden="true"><rect x="6" y="10" width="108" height="104" rx="22" fill="#0C0E11"/><rect x="6" y="6" width="108" height="100" rx="22" fill="#3A7BD5"/><path d="M30 56 H78" stroke="#fff" stroke-width="11" stroke-linecap="round"/><path d="M64 38 L84 56 L64 74" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/><path d="M92 36 V76" stroke="#fff" stroke-width="11" stroke-linecap="round"/></svg>
+      CaseComplete
+    </a>
+    <nav>
+      <a href="https://github.com/drknowhow/casecomplete">GitHub</a>
+      <a href="https://github.com/drknowhow/casecomplete/releases/latest">Download</a>
+      <a href="https://github.com/sponsors/drknowhow">Sponsor</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <h1>Just type.</h1>
+    <p>A Windows typing assistant that fixes your typos as you go, finishes your sentences, and learns how you write. Everything runs on your own computer.</p>
+    <a class="cta" href="https://github.com/drknowhow/casecomplete/releases/latest">Download for Windows</a>
+    <span class="sub">Free and open source · per-user install, no admin · Windows 11</span>
+    <div class="video">
+      <video controls playsinline preload="metadata" poster="brand/social-preview.png">
+        <source src="media/casecomplete-promo.mp4" type="video/mp4">
+        Your browser cannot play this video. <a href="media/casecomplete-promo.mp4">Download it</a>.
+      </video>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card"><h3>Fixes typos on the space bar</h3><p><code>thhe</code> becomes <code>the</code> the instant you finish the word. A brief blue underline shows what moved; <span class="kbd">←</span> within 3 seconds undoes it.</p></div>
+    <div class="card"><h3>Finishes your sentences</h3><p>Pause and grey ghost text completes the sentence. <span class="kbd">Tab</span> accepts it and offers the next one. <span class="kbd">Ctrl</span>+<span class="kbd">Tab</span> takes one word.</p></div>
+    <div class="card"><h3>Learns how you write</h3><p>Retype a word and the pair becomes an autocorrect entry. Undo a fix twice and the word joins your dictionary. Rules you keep undoing stop auto-applying.</p></div>
+    <div class="card"><h3>Works everywhere</h3><p>Mail, chat, browsers, editors, terminals. Built with Claude Code's prompt in mind.</p></div>
+    <div class="card"><h3>Fast</h3><p>About 120 ms from keystroke to suggestion on an NVIDIA GPU, with Gemma 3 1B. Runs on CPU with SmolLM2.</p></div>
+    <div class="card"><h3>Insights</h3><p>A tray flyout with today's numbers, and a dashboard with acceptance over time, latency, per-app stats, and what the model saw.</p></div>
+  </section>
+
+  <section class="privacy">
+    <div>
+      <h2>Everything stays on your computer.</h2>
+      <p style="color:#B6B9BF;margin:0">No account, no cloud, no telemetry. The only network calls are the first-run downloads of the engine and the model.</p>
+    </div>
+    <ul>
+      <li>Card numbers, SSNs, IBANs, account numbers and <code>password:</code> secrets never reach the model.</li>
+      <li>Banking and health sites are off by default, and the list is yours to edit.</li>
+      <li>Delete one folder and it forgets everything.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <span>MIT license · <a href="https://github.com/drknowhow/casecomplete">source on GitHub</a></span>
+    <span>Models: Gemma 3 1B (Google), SmolLM2 (Hugging Face), Qwen2.5 (Alibaba) · engine: llama.cpp · grammar: Harper</span>
+  </footer>
+</div>
+</body>
+</html>

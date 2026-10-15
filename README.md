@@ -29,7 +29,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/drknowhow/casecomplete/releases/download/v0.1.0/casecomplete-promo.mp4">Watch the 40-second promo</a>
+  <a href="https://drknowhow.github.io/casecomplete/">▶ Watch the 40-second promo with sound</a>
 </p>
 
 ## How it works
