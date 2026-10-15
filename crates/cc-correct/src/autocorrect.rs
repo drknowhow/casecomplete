@@ -43,6 +43,11 @@ impl AutocorrectList {
         Some(apply_case(word, fix))
     }
 
+    /// `word` has an entry the user made or taught, as opposed to a seeded one.
+    pub fn is_user_entry(&self, word: &str) -> bool {
+        self.user.contains_key(&word.to_lowercase())
+    }
+
     pub fn add(&mut self, typo: &str, fix: &str) {
         self.user.insert(typo.to_lowercase(), fix.to_string());
     }

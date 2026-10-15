@@ -210,6 +210,14 @@ impl Checker {
         self.analyze(text, dictionary).candidates
     }
 
+    /// Whether `word` is spelled right: in Harper's dictionary (any capitalisation) or the
+    /// personal dictionary. Surrounding punctuation is ignored; a token with no letters
+    /// (a number, a symbol) counts as a word.
+    pub fn is_word(&self, word: &str, dictionary: &PersonalDictionary) -> bool {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        !word.chars().any(char::is_alphabetic) || dictionary.contains(word) || self.dict.contains_word_str(word)
+    }
+
     /// Like [`Checker::check`] but also reports the Harper lints that were dropped, and why.
     #[doc(hidden)]
     pub fn analyze(&self, text: &str, dictionary: &PersonalDictionary) -> Analysis {
@@ -310,6 +318,21 @@ impl Checker {
         }
         if replacement == original {
             return Err(drop("replacement_equals_original"));
+        }
+        // Capitalisation rules find a name or acronym in Harper's dictionary that matches a
+        // lowercase typo of a common word: `fromm` -> `Fromm`, `orr` -> `Orr`, `ne` -> `NE`.
+        if severity == Severity::S1
+            && is_recase(&original, &replacement)
+            && !matches!(rule, "capitalize_personal_pronouns" | "sentence_capitalization")
+        {
+            if let Some((fix, confidence)) = common_word_typo(&original) {
+                let rule = "spell".to_string();
+                return Ok((Candidate { start, end, original, replacement: fix, rule, severity: Severity::S0, confidence }, true));
+            }
+            if near_common_word(&original) || is_shouty(&replacement) {
+                severity = Severity::S2;
+                confidence = 0.5;
+            }
         }
         Ok((
             Candidate {
@@ -622,6 +645,47 @@ fn shape_ok(cand: &str, original: &str) -> bool {
     !(cand_inner_upper && !orig_inner_upper)
 }
 
+/// `replacement` is the all-lowercase `original` with capitals added.
+fn is_recase(original: &str, replacement: &str) -> bool {
+    !original.chars().any(char::is_uppercase) && original.to_lowercase() == replacement.to_lowercase()
+}
+
+/// Two or more letters, all capitals: an acronym.
+fn is_shouty(word: &str) -> bool {
+    word.chars().filter(|c| c.is_alphabetic()).count() >= 2 && !word.chars().any(char::is_lowercase)
+}
+
+/// Common words one edit away from `word`, with the typing-error cost of each.
+fn common_neighbours(word: &str) -> Vec<(f32, &'static str)> {
+    let typed: Vec<char> = word.chars().map(lc).collect();
+    common_words()
+        .iter()
+        .filter_map(|w| {
+            let cand: Vec<char> = w.chars().collect();
+            (osa_distance(&typed, &cand) == 1).then(|| (typo_cost(&typed, &cand), *w))
+        })
+        .collect()
+}
+
+fn near_common_word(word: &str) -> bool {
+    !common_neighbours(word).is_empty()
+}
+
+/// The common word that `word` is a one-key typo of, when the typing model clearly prefers
+/// one, with the confidence an S0 fix gets.
+fn common_word_typo(word: &str) -> Option<(String, f32)> {
+    let len = word.chars().count();
+    if len < MIN_S0_LEN || common_words().contains(word) {
+        return None;
+    }
+    let mut scored = common_neighbours(word);
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+    let best = scored.first()?;
+    let margin = scored.get(1).map_or(f32::INFINITY, |second| second.0 - best.0);
+    let confidence = 1.0 - 1.0 / len as f32;
+    (margin >= S0_MIN_MARGIN && confidence >= S0_MIN_CONFIDENCE).then(|| (best.1.to_string(), confidence))
+}
+
 fn lowercase_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -920,6 +984,41 @@ mod tests {
         assert!((c.confidence - 0.75).abs() < 1e-6, "{}", c.confidence);
         let c = &checker().check("I saw reviewe today.", &PersonalDictionary::default())[0];
         assert!((c.confidence - (1.0 - 1.0 / 7.0)).abs() < 1e-6, "{}", c.confidence);
+    }
+
+    #[test]
+    fn lowercase_typo_of_a_common_word_is_fixed_not_capitalised() {
+        let dict = PersonalDictionary::default();
+        for (text, typo, fix) in [("words fromm", "fromm", "from"), ("this orr", "orr", "or")] {
+            let cands = checker().check(text, &dict);
+            let c = cands.iter().find(|c| c.original == typo).unwrap_or_else(|| panic!("{text}: {cands:?}"));
+            assert_eq!((c.replacement.as_str(), c.severity.clone(), c.rule.as_str()), (fix, Severity::S0, "spell"), "{text}");
+        }
+        for text in ["glitches dan", "safety ne", "ne"] {
+            let cands = checker().check(text, &dict);
+            assert!(
+                cands.iter().all(|c| c.severity >= Severity::S2 || c.replacement.to_lowercase() != c.original),
+                "{text}: a recase must not auto-apply: {cands:?}"
+            );
+        }
+        for (text, name) in [("check with claude", "Claude"), ("a chinese model", "Chinese")] {
+            let cands = checker().check(text, &dict);
+            assert!(cands.iter().any(|c| c.replacement == name && c.severity == Severity::S1), "{text}: {cands:?}");
+        }
+    }
+
+    #[test]
+    fn is_word_knows_dictionary_and_personal_words() {
+        let c = checker();
+        let mut dict = PersonalDictionary::default();
+        for w in ["the", "The", "don't", "Fromm", "(word),", "42", "-"] {
+            assert!(c.is_word(w, &dict), "{w}");
+        }
+        for w in ["does't", "medge", "xqzt"] {
+            assert!(!c.is_word(w, &dict), "{w}");
+        }
+        dict.add("xqzt");
+        assert!(c.is_word("xqzt", &dict));
     }
 
     #[test]
