@@ -24,6 +24,14 @@
   <a href="docs/research-and-architecture.md">Architecture</a>
 </p>
 
+<p align="center">
+  <img src="docs/hero.gif" alt="CaseComplete fixing typos and completing a sentence as you type" width="860">
+</p>
+
+<p align="center">
+  <a href="https://github.com/drknowhow/casecomplete/releases/download/v0.1.0/casecomplete-promo.mp4">Watch the 40-second promo</a>
+</p>
+
 ## How it works
 
 | | |

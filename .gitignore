@@ -6,6 +6,8 @@
 *.log
 .env
 /installer/out/
+/promo/node_modules/
+/promo/out/
 
 # local tooling and agent config, never published
 /.c3/
