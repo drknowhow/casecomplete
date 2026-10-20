@@ -867,6 +867,11 @@ impl App {
         // app after the one being handled means the field no longer ends where the shadow does.
         if !self.swallow.begin_capture(self.applied) {
             log::info!("fix not applied: typed ahead of it");
+            // The caller may have started capture (to ask the model first); end it, or the
+            // keys it holds would never be replayed.
+            if self.swallow.capturing() {
+                self.end_capture();
+            }
             return false;
         }
         let passed = self.applied;
