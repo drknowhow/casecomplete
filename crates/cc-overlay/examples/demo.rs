@@ -2,7 +2,7 @@
 //! 500 ms, with a small offset pattern so it visibly moves even if the mouse is still),
 //! then an underline fades out under the last position, then the overlay shuts down.
 //!
-//! Run: `cargo run -p cc-overlay --example demo`
+//! Run: `cargo run -p cc-overlay --example overlay_demo`
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};

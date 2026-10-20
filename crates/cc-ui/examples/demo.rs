@@ -2,7 +2,7 @@
 //! (applying commands, rewriting the word files). Handy for looking at the pages:
 //!
 //! ```text
-//! cargo run -p cc-ui --example demo -- [profile-dir]
+//! cargo run -p cc-ui --example ui_demo -- [profile-dir]
 //! ```
 //!
 //! Prints the flyout and dashboard addresses and serves until Ctrl-C or Quit.
