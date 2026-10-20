@@ -48,9 +48,9 @@ const UNDERLINE_FADE_MS: u32 = 1500;
 /// Electron apps can take a while to update what UIA sees.
 const FIX_CHECK_RETRIES: u8 = 2;
 const FIX_RECHECK_AFTER: Duration = Duration::from_millis(200);
-/// How long a fix waits for the language model's view of the word; past it, the fix goes
-/// in on the typing model alone.
-const MODEL_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long a fix waits for the language model's view of the word. A fix that needs that
+/// view and gets no answer in time is not typed.
+const MODEL_CHECK_TIMEOUT: Duration = Duration::from_millis(300);
 /// Next-token candidates asked for in that check.
 const MODEL_CHECK_TOKENS: u32 = 40;
 const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
@@ -582,10 +582,11 @@ impl App {
         }
     }
 
-    /// A dictionary word close to `typo` that the model clearly expects after `before` (the
-    /// text up to the typo) instead of `fix` (`fixgate::model_prefers`). None when the
-    /// engine is not running or does not answer in time.
-    fn model_prefers_other(&self, before: &str, typo: &str, fix: &str) -> Option<String> {
+    /// Why the language model stops the fix of `typo` to `fix`, if it does: it clearly
+    /// expects another dictionary word close to `typo` after `before` (the text up to the
+    /// typo; `fixgate::model_prefers`), or it gave no answer in time. None lets the fix go
+    /// in; so does having no engine, or no text before the typo to ask about.
+    fn model_objection(&self, before: &str, typo: &str, fix: &str) -> Option<String> {
         self.sidecar.as_ref()?;
         let ctx = before.trim_end_matches(' ');
         if ctx.trim().is_empty() {
@@ -593,21 +594,22 @@ impl App {
         }
         let prompt = self.prompt_for(ctx.to_string());
         let client = self.client.clone();
+        let t0 = Instant::now();
         let asked = self.rt.block_on(async move {
             tokio::time::timeout(MODEL_CHECK_TIMEOUT, client.next_tokens(&prompt, MODEL_CHECK_TOKENS)).await
         });
+        let ms = t0.elapsed().as_millis();
         let top = match asked {
             Ok(Ok(top)) => top,
             Ok(Err(e)) => {
-                log::debug!("model check failed: {e:#}");
-                return None;
+                log::debug!("model check failed after {ms} ms: {e:#}");
+                return Some("the model gave no answer".into());
             }
-            Err(_) => {
-                log::debug!("model check took over {} ms", MODEL_CHECK_TIMEOUT.as_millis());
-                return None;
-            }
+            Err(_) => return Some(format!("the model gave no answer within {ms} ms")),
         };
+        log::debug!("model check answered in {ms} ms");
         fixgate::model_prefers(typo, fix, &top, |w| self.checker.is_word(w, &self.dict))
+            .map(|word| format!("the model expects {word:?}"))
     }
 
     fn show_ghost(&mut self) {
@@ -696,6 +698,7 @@ impl App {
         if self.breaker.paused(self.last_hwnd, Instant::now()) || self.landing_too_low() {
             return;
         }
+        let (hwnd, element) = (self.last_hwnd, self.last_element);
         let text = self.shadow.text();
         let body = &text[..text.len() - boundary.len_utf8()];
         let body_len = body.len();
@@ -759,6 +762,16 @@ impl App {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
         }
+        // A fix goes only where a completion may: an editable field, not a password, in an app
+        // the privacy settings allow. The focus is read again: the last read may be from
+        // before a click or a window switch, and then the shadow describes another field.
+        let allowed = self.field_allowed();
+        if !allowed || self.last_hwnd != hwnd || (element != 0 && self.last_element != element) {
+            let why = if allowed { "the focus moved" } else { "the focus is not a field it may type in" };
+            log::info!("fix {:?} -> {:?} [{}] not applied: {why}", c.original, c.replacement, c.rule);
+            self.prev_boundary = None;
+            return;
+        }
         let check_ms = t0.elapsed().as_millis() as u32;
         log::info!(
             "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
@@ -775,8 +788,8 @@ impl App {
             }
             let text = self.shadow.text();
             let before = text[..text.len() - boundary.len_utf8() - c.original.len()].to_string();
-            if let Some(expected) = self.model_prefers_other(&before, &c.original, &c.replacement) {
-                log::info!("fix {:?} -> {:?} not applied: the model expects {:?}", c.original, c.replacement, expected);
+            if let Some(why) = self.model_objection(&before, &c.original, &c.replacement) {
+                log::info!("fix {:?} -> {:?} not applied: {why}", c.original, c.replacement);
                 self.end_capture();
                 self.prev_boundary = Some((word, self.shadow.text().chars().count()));
                 return;
@@ -849,7 +862,8 @@ impl App {
             return;
         }
         let prev_is_unknown = self.checker.check(prev, &self.dict).iter().any(|c| c.rule == "spell");
-        if !prev_is_unknown {
+        // Nothing is learned from a field it may not type in, such as a password.
+        if !prev_is_unknown || !self.field_allowed() {
             return;
         }
         self.auto.add(prev, word);
@@ -1636,8 +1650,8 @@ fn start() -> anyhow::Result<()> {
     let (tx, rx) = unbounded::<Msg>();
     let engine = spawn_engine(CompletionClient::new(&sidecar_url()), tx.clone());
     // Its own client: a pooled connection is driven by the runtime that opened it, and this
-    // one runs only while the orchestrator waits on a model check.
-    let client = CompletionClient::new(&sidecar_url());
+    // one runs only while the orchestrator waits on a model check. So it keeps none.
+    let client = CompletionClient::unpooled(&sidecar_url());
 
     let overlay = Overlay::new().context("overlay")?;
     let swallow = Arc::new(SwallowState::default());
