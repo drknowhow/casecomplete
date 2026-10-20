@@ -8,6 +8,9 @@
 //!   Left / Backspace are swallowed only while `now_ms < revert_until_ms` (then reported as
 //!   `RevertRequested`). Ctrl+Alt+Z is always swallowed and reported as `RevertRequested`.
 //! - Injected input (`LLKHF_INJECTED`) is ignored so our own SendInput never echoes back.
+//! - Every key and click that reaches the app is numbered, and each event carries that
+//!   number, so the orchestrator can tell whether anything reached the app after the
+//!   event it is handling ([`SwallowState::begin_capture`]).
 //! - `ShadowBuffer` is a pure data structure; the orchestrator (not the hook) updates it.
 //!
 //! Implementation notes:
@@ -71,17 +74,17 @@ pub enum HookEvent {
 #[derive(Debug, Default)]
 pub struct SwallowState {
     pub ghost_visible: AtomicBool,
-    /// Milliseconds since process start; Left/Backspace revert until then.
+    /// Milliseconds since process start; Left/Backspace revert until then. The hook clears
+    /// it on the next key, which makes the fix no longer the last thing typed.
     pub revert_until_ms: AtomicU64,
-    /// While set, text keys are swallowed and reported as `Captured` so they cannot
-    /// interleave with an injection in progress.
-    pub capture: AtomicBool,
+    /// Bit 0: capture is on, so text keys are swallowed and reported as `Captured` and
+    /// cannot interleave with an injection in progress. The other bits count the keys and
+    /// clicks that reached the app. One word, so that starting capture and letting a key
+    /// through cannot cross.
+    gate: AtomicU64,
     /// Keys reported as `Captured` so far. Counted before sending, so a key still on its
     /// way to the orchestrator shows up here first.
     pub captured: AtomicU64,
-    /// Keys and clicks let through while `capture` was set (arrows, shortcuts, mouse
-    /// buttons): each may have moved the caret or changed the text under an injection.
-    pub passed: AtomicU64,
 }
 
 impl SwallowState {
@@ -91,16 +94,49 @@ impl SwallowState {
     pub fn set_revert_until(&self, ms: u64) {
         self.revert_until_ms.store(ms, Ordering::SeqCst);
     }
-    pub fn set_capture(&self, v: bool) {
-        self.capture.store(v, Ordering::SeqCst);
+    /// Turns capture on, or keeps it on, if nothing has reached the app since the key or
+    /// click numbered `seen`. False means something got through after it, so the text or
+    /// the caret may no longer be where the orchestrator thinks.
+    pub fn begin_capture(&self, seen: u64) -> bool {
+        self.gate
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |g| (g >> 1 == seen).then_some(g | 1))
+            .is_ok()
+    }
+    pub fn end_capture(&self) {
+        self.gate.fetch_and(!1, Ordering::SeqCst);
+    }
+    pub fn capturing(&self) -> bool {
+        self.gate.load(Ordering::SeqCst) & 1 == 1
     }
     pub fn captured(&self) -> u64 {
         self.captured.load(Ordering::SeqCst)
     }
+    /// Keys and clicks that have reached the app so far.
     pub fn passed(&self) -> u64 {
-        self.passed.load(Ordering::SeqCst)
+        self.gate.load(Ordering::SeqCst) >> 1
+    }
+    /// Counts one key or click that goes through to the app and returns its number.
+    fn pass(&self) -> u64 {
+        (self.gate.fetch_add(2, Ordering::SeqCst) >> 1) + 1
+    }
+    /// Like [`Self::pass`] for a key that capture swallows: None while capture is on.
+    fn pass_unless_capturing(&self) -> Option<u64> {
+        let mut g = self.gate.load(Ordering::SeqCst);
+        loop {
+            if g & 1 == 1 {
+                return None;
+            }
+            match self.gate.compare_exchange_weak(g, g + 2, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some((g >> 1) + 1),
+                Err(now) => g = now,
+            }
+        }
     }
 }
+
+/// A hook event and how many keys and clicks had reached the app when it happened, its own
+/// key included when that went through ([`SwallowState::passed`]).
+pub type Stamped = (u64, HookEvent);
 
 /// Keeps the hook alive; dropping it unhooks and stops the thread.
 pub struct HookHandle {
@@ -128,7 +164,7 @@ impl Drop for HookHandle {
 
 /// Install the hook on a new thread. Events arrive on `tx`.
 pub fn start(
-    tx: crossbeam_channel::Sender<HookEvent>,
+    tx: crossbeam_channel::Sender<Stamped>,
     swallow: Arc<SwallowState>,
 ) -> anyhow::Result<HookHandle> {
     // Pin the shared clock origin before the first key can arrive.
@@ -314,7 +350,7 @@ const OWN_EXTRA_INFO: usize = 0x4343_4F4D;
 const TOUNICODE_NO_STATE_CHANGE: u32 = 0x4;
 
 struct HookCtx {
-    tx: crossbeam_channel::Sender<HookEvent>,
+    tx: crossbeam_channel::Sender<Stamped>,
     swallow: Arc<SwallowState>,
 }
 
@@ -325,7 +361,7 @@ thread_local! {
 }
 
 fn hook_thread(
-    tx: crossbeam_channel::Sender<HookEvent>,
+    tx: crossbeam_channel::Sender<Stamped>,
     swallow: Arc<SwallowState>,
     ready: mpsc::Sender<Result<u32, String>>,
 ) {
@@ -394,10 +430,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         CTX.with(|cell| {
             if let Ok(guard) = cell.try_borrow() {
                 if let Some(ctx) = guard.as_ref() {
-                    if ctx.swallow.capture.load(Ordering::SeqCst) {
-                        ctx.swallow.passed.fetch_add(1, Ordering::SeqCst);
-                    }
-                    let _ = ctx.tx.try_send(HookEvent::Click);
+                    let seq = ctx.swallow.pass();
+                    send(ctx, seq, HookEvent::Click);
                 }
             }
         });
@@ -406,14 +440,16 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-/// Sends a typed character: as `Captured` while capturing, else as `Char`.
-fn send_char(ctx: &HookCtx, c: char, capture: bool) {
-    if capture {
-        ctx.swallow.captured.fetch_add(1, Ordering::SeqCst);
-        let _ = ctx.tx.try_send(HookEvent::Captured(c));
-    } else {
-        let _ = ctx.tx.try_send(HookEvent::Char(c));
-    }
+/// Drops the event when the channel is full: the hook must never block. The orchestrator
+/// notices the gap in the numbers.
+fn send(ctx: &HookCtx, seq: u64, ev: HookEvent) {
+    let _ = ctx.tx.try_send((seq, ev));
+}
+
+/// Reports a key that capture swallowed; '\u{8}' is Backspace, '\n' is Enter.
+fn send_captured(ctx: &HookCtx, c: char) {
+    ctx.swallow.captured.fetch_add(1, Ordering::SeqCst);
+    send(ctx, ctx.swallow.passed(), HookEvent::Captured(c));
 }
 
 fn is_modifier(vk: u32) -> bool {
@@ -438,81 +474,99 @@ fn handle_key(msg: u32, kb: &KBDLLHOOKSTRUCT) -> bool {
         log::trace!("own vk={:#x} scan={:#x} flags={:#x}", kb.vkCode, kb.scanCode, kb.flags.0);
         return false;
     }
-    // Synthetic input from other processes is ignored unless the e2e flag is set
-    // (CC_ACCEPT_INJECTED=1 lets a test harness drive the app with SendKeys).
-    if kb.flags.0 & LLKHF_INJECTED.0 != 0 && !accept_injected() {
-        return false;
-    }
 
     CTX.with(|cell| {
         let Ok(guard) = cell.try_borrow() else { return false };
         let Some(ctx) = guard.as_ref() else { return false };
-
+        let state = &ctx.swallow;
         let vk = kb.vkCode;
+
+        // Synthetic input from other processes is not reported unless the e2e flag is set
+        // (CC_ACCEPT_INJECTED=1 lets a test harness drive the app with SendKeys). It still
+        // reaches the app, so it is counted.
+        if kb.flags.0 & LLKHF_INJECTED.0 != 0 && !accept_injected() {
+            if !is_modifier(vk) {
+                state.pass();
+            }
+            return false;
+        }
+
         let ctrl = key_down(vk::CONTROL);
         let alt = key_down(vk::MENU);
         let win = key_down(vk::LWIN) || key_down(vk::RWIN);
-        let ghost = ctx.swallow.ghost_visible.load(Ordering::SeqCst);
-        let in_revert = now_ms() < ctx.swallow.revert_until_ms.load(Ordering::SeqCst);
+        let ghost = state.ghost_visible.load(Ordering::SeqCst);
+        let in_revert = now_ms() < state.revert_until_ms.load(Ordering::SeqCst);
 
         let (ev, swallow) = decide(vk, ctrl, alt, ghost, in_revert);
-        let capture = ctx.swallow.capture.load(Ordering::SeqCst);
-        match ev {
-            Some(HookEvent::Backspace) if capture => {
-                send_char(ctx, '\u{8}', true);
-                return true;
-            }
-            Some(HookEvent::Enter) if capture => {
-                send_char(ctx, '\n', true);
-                return true;
-            }
-            _ => {}
+        if !is_modifier(vk) && ev != Some(HookEvent::RevertRequested) {
+            state.revert_until_ms.store(0, Ordering::SeqCst);
         }
-        let passes = |ctx: &HookCtx| {
-            if capture && !is_modifier(vk) {
-                ctx.swallow.passed.fetch_add(1, Ordering::SeqCst);
+        if is_modifier(vk) || swallow {
+            if let Some(e) = ev {
+                send(ctx, state.passed(), e);
             }
-        };
+            return swallow;
+        }
 
         // Text keys (decide() says Other), plus Ctrl+Alt+Z, which on AltGr layouts can be a
         // real character (e.g. Polish AltGr+Z) and must not be eaten as a revert.
         let altgr_z = vk == vk::Z && ctrl && alt;
         let try_text =
             !win && ((matches!(ev, Some(HookEvent::Other(_))) && may_translate(ctrl, alt, win)) || altgr_z);
-        if try_text {
+        let text = if !try_text {
+            None
+        } else if vk == vk::PACKET {
             // KEYEVENTF_UNICODE arrives as VK_PACKET with the UTF-16 unit in scanCode.
             // Calling ToUnicodeEx on it consumes the pending character and corrupts what
-            // the target app receives, so read the unit directly instead.
-            if vk == vk::PACKET {
-                if let Some(c) = char::from_u32(kb.scanCode) {
-                    send_char(ctx, c, capture);
-                }
-                return capture;
-            }
+            // the target app receives, so read the unit directly instead. Half a surrogate
+            // pair is not a char and goes through as an unknown key.
+            char::from_u32(kb.scanCode).map(CharBuf::one)
+        } else {
             match translate(vk, kb.scanCode) {
-                Translation::Text(buf) => {
-                    for &c in &buf.chars[..buf.len] {
-                        send_char(ctx, c, capture);
-                    }
-                    return capture;
-                }
-                // Dead key: let the app compose it; the orchestrator sees nothing.
+                Translation::Text(buf) => Some(buf),
+                // Dead key: the app composes it with the next key, which the shadow cannot
+                // follow, so the orchestrator is told an unknown key went through.
                 Translation::Dead => {
-                    passes(ctx);
+                    let seq = state.pass();
+                    send(ctx, seq, HookEvent::Other(vk));
                     return false;
                 }
-                Translation::NoText => {}
+                Translation::NoText => None,
             }
+        };
+        if let Some(buf) = text {
+            let chars = &buf.chars[..buf.len];
+            return match state.pass_unless_capturing() {
+                None => {
+                    chars.iter().for_each(|&c| send_captured(ctx, c));
+                    true
+                }
+                Some(seq) => {
+                    chars.iter().for_each(|&c| send(ctx, seq, HookEvent::Char(c)));
+                    false
+                }
+            };
         }
 
+        let captured = match ev {
+            Some(HookEvent::Backspace) => Some('\u{8}'),
+            Some(HookEvent::Enter) => Some('\n'),
+            _ => None,
+        };
+        let seq = match captured {
+            Some(c) => match state.pass_unless_capturing() {
+                Some(seq) => seq,
+                None => {
+                    send_captured(ctx, c);
+                    return true;
+                }
+            },
+            None => state.pass(),
+        };
         if let Some(e) = ev {
-            // Drop on full: the hook must never block.
-            let _ = ctx.tx.try_send(e);
+            send(ctx, seq, e);
         }
-        if !swallow {
-            passes(ctx);
-        }
-        swallow
+        false
     })
 }
 
@@ -525,6 +579,12 @@ fn key_down(vk: u32) -> bool {
 struct CharBuf {
     chars: [char; 4],
     len: usize,
+}
+
+impl CharBuf {
+    fn one(c: char) -> CharBuf {
+        CharBuf { chars: [c, '\0', '\0', '\0'], len: 1 }
+    }
 }
 
 enum Translation {
@@ -824,7 +884,7 @@ mod tests {
 
     // ---- hook_proc plumbing (called directly on the test thread; needs no real hook) ----
 
-    fn install_ctx() -> (crossbeam_channel::Receiver<HookEvent>, Arc<SwallowState>) {
+    fn install_ctx() -> (crossbeam_channel::Receiver<Stamped>, Arc<SwallowState>) {
         let (tx, rx) = crossbeam_channel::bounded(16);
         let swallow = Arc::new(SwallowState::default());
         CTX.with(|c| *c.borrow_mut() = Some(HookCtx { tx, swallow: swallow.clone() }));
@@ -852,17 +912,22 @@ mod tests {
 
     // These assume no Ctrl/Alt/Win key is physically held while the tests run.
 
+    /// A KEYEVENTF_UNICODE key carrying `c`, which the hook reads without the keyboard layout.
+    fn packet(c: char) -> KBDLLHOOKSTRUCT {
+        KBDLLHOOKSTRUCT { scanCode: c as u32, ..kb(vk::PACKET, 0, 0) }
+    }
+
     #[test]
     fn proc_ghost_tab_swallowed_and_reported() {
         let (rx, swallow) = install_ctx();
         let k = kb(vk::TAB, 0, 0);
         assert!(!feed(WM_KEYDOWN, &k));
-        assert_eq!(rx.try_recv(), Ok(E::Tab));
+        assert_eq!(rx.try_recv(), Ok((1, E::Tab)), "a Tab that reaches the app is counted");
         swallow.set_ghost_visible(true);
         assert!(feed(WM_KEYDOWN, &k));
-        assert_eq!(rx.try_recv(), Ok(E::Tab));
+        assert_eq!(rx.try_recv(), Ok((1, E::Tab)));
         assert!(feed(WM_SYSKEYDOWN, &k));
-        assert_eq!(rx.try_recv(), Ok(E::Tab));
+        assert_eq!(rx.try_recv(), Ok((1, E::Tab)));
     }
 
     #[test]
@@ -872,30 +937,65 @@ mod tests {
         let back = kb(vk::BACK, 0, 0);
         swallow.set_revert_until(now_ms() + 60_000);
         assert!(feed(WM_KEYDOWN, &left));
-        assert_eq!(rx.try_recv(), Ok(E::RevertRequested));
+        assert_eq!(rx.try_recv(), Ok((0, E::RevertRequested)));
         assert!(feed(WM_KEYDOWN, &back));
-        assert_eq!(rx.try_recv(), Ok(E::RevertRequested));
+        assert_eq!(rx.try_recv(), Ok((0, E::RevertRequested)));
         swallow.set_revert_until(0);
         assert!(!feed(WM_KEYDOWN, &left));
-        assert_eq!(rx.try_recv(), Ok(E::Left));
+        assert_eq!(rx.try_recv(), Ok((1, E::Left)));
         assert!(!feed(WM_KEYDOWN, &back));
-        assert_eq!(rx.try_recv(), Ok(E::Backspace));
+        assert_eq!(rx.try_recv(), Ok((2, E::Backspace)));
+    }
+
+    #[test]
+    fn proc_any_key_after_a_fix_closes_the_revert_window() {
+        let (rx, swallow) = install_ctx();
+        swallow.set_revert_until(now_ms() + 60_000);
+        assert!(!feed(WM_KEYDOWN, &kb(vk::SHIFT, 0, 0)), "a modifier keeps it open");
+        assert!(!feed(WM_KEYDOWN, &packet('x')));
+        assert!(!feed(WM_KEYDOWN, &kb(vk::BACK, 0, 0)), "Backspace after a typed key is a Backspace");
+        let events: Vec<_> = rx.try_iter().map(|(_, e)| e).collect();
+        assert_eq!(events, [E::Other(vk::SHIFT), E::Char('x'), E::Backspace]);
     }
 
     #[test]
     fn proc_counts_captured_keys_and_keys_let_through_while_capturing() {
         let (rx, swallow) = install_ctx();
-        swallow.set_capture(true);
+        assert!(swallow.begin_capture(0));
         assert!(feed(WM_KEYDOWN, &kb(vk::BACK, 0, 0)));
-        assert_eq!(rx.try_recv(), Ok(E::Captured('\u{8}')));
-        assert_eq!(swallow.captured(), 1);
+        assert_eq!(rx.try_recv(), Ok((0, E::Captured('\u{8}'))));
+        assert!(feed(WM_KEYDOWN, &packet('a')));
+        assert_eq!(rx.try_recv(), Ok((0, E::Captured('a'))));
+        assert_eq!(swallow.captured(), 2);
         assert!(!feed(WM_KEYDOWN, &kb(vk::DOWN, 0, 0)));
-        assert_eq!(rx.try_recv(), Ok(E::Nav));
+        assert_eq!(rx.try_recv(), Ok((1, E::Nav)));
         assert!(!feed(WM_KEYDOWN, &kb(vk::SHIFT, 0, 0)));
         assert_eq!(swallow.passed(), 1, "a modifier alone changes nothing");
-        swallow.set_capture(false);
+        swallow.end_capture();
         assert!(!feed(WM_KEYDOWN, &kb(vk::DOWN, 0, 0)));
-        assert_eq!((swallow.captured(), swallow.passed()), (1, 1));
+        assert_eq!((swallow.captured(), swallow.passed()), (2, 2));
+    }
+
+    #[test]
+    fn begin_capture_fails_once_something_got_through() {
+        let (_rx, swallow) = install_ctx();
+        assert!(swallow.begin_capture(0));
+        assert!(swallow.begin_capture(0), "keeping capture on");
+        swallow.end_capture();
+        assert!(!feed(WM_KEYDOWN, &packet('t')));
+        assert!(!swallow.begin_capture(0), "the t reached the app after event 0");
+        assert!(!swallow.capturing());
+        assert!(swallow.begin_capture(1));
+        assert!(feed(WM_KEYDOWN, &packet('o')), "captured once capture is on");
+    }
+
+    #[test]
+    fn proc_reports_half_a_surrogate_pair_as_an_unknown_key() {
+        let (rx, swallow) = install_ctx();
+        assert!(swallow.begin_capture(0));
+        let half = KBDLLHOOKSTRUCT { scanCode: 0xD83D, ..kb(vk::PACKET, 0, 0) };
+        assert!(!feed(WM_KEYDOWN, &half));
+        assert_eq!(rx.try_recv(), Ok((1, E::Other(vk::PACKET))));
     }
 
     #[test]
@@ -906,12 +1006,11 @@ mod tests {
         click(WM_MOUSEMOVE);
         assert!(rx.try_recv().is_err());
         click(WM_LBUTTONDOWN);
-        assert_eq!(rx.try_recv(), Ok(E::Click));
-        assert_eq!(swallow.passed(), 0);
-        swallow.set_capture(true);
+        assert_eq!(rx.try_recv(), Ok((1, E::Click)));
+        assert!(swallow.begin_capture(1));
         click(WM_RBUTTONDOWN);
-        assert_eq!(rx.try_recv(), Ok(E::Click));
-        assert_eq!(swallow.passed(), 1);
+        assert_eq!(rx.try_recv(), Ok((2, E::Click)));
+        assert_eq!(swallow.passed(), 2);
     }
 
     #[test]
@@ -920,25 +1019,28 @@ mod tests {
         swallow.set_ghost_visible(true);
         let injected = kb(vk::TAB, LLKHF_INJECTED.0, 0);
         assert!(!feed(WM_KEYDOWN, &injected));
+        assert_eq!(swallow.passed(), 1, "another program's key still reaches the app");
         let tagged = kb(vk::TAB, 0, OWN_EXTRA_INFO);
         assert!(!feed(WM_KEYDOWN, &tagged));
         let plain = kb(vk::TAB, 0, 0);
         const WM_KEYUP: u32 = 0x0101;
         assert!(!feed(WM_KEYUP, &plain));
         assert!(rx.try_recv().is_err(), "no events expected");
+        assert_eq!(swallow.passed(), 1);
     }
 
     #[test]
     fn proc_full_channel_drops_instead_of_blocking() {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let swallow = Arc::new(SwallowState::default());
-        CTX.with(|c| *c.borrow_mut() = Some(HookCtx { tx, swallow }));
+        CTX.with(|c| *c.borrow_mut() = Some(HookCtx { tx, swallow: swallow.clone() }));
         let k = kb(vk::RETURN, 0, 0);
         for _ in 0..5 {
             assert!(!feed(WM_KEYDOWN, &k));
         }
-        assert_eq!(rx.try_recv(), Ok(E::Enter));
+        assert_eq!(rx.try_recv(), Ok((1, E::Enter)));
         assert!(rx.try_recv().is_err());
+        assert_eq!(swallow.passed(), 5, "dropped events still count, so the gap shows");
     }
 
     #[test]

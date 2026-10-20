@@ -50,7 +50,8 @@ const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
 const TERMINAL_EXES: &[&str] = &["windowsterminal.exe", "conhost.exe", "openconsole.exe", "wezterm-gui.exe", "alacritty.exe"];
 
 enum Msg {
-    Key(HookEvent),
+    /// A hook event and how many keys and clicks had reached the app with it.
+    Key(u64, HookEvent),
     Token { gen: u64, text: String, logprob: Option<f32> },
     Done { gen: u64, result: anyhow::Result<Completion> },
 }
@@ -214,8 +215,14 @@ struct App {
     dont_touch: HashSet<String>,
     reverts: HashMap<String, u32>,
     shadow: ShadowBuffer,
+    /// The count (`SwallowState::passed`) of keys and clicks the shadow has taken in. While
+    /// the hook's count is higher, keys are still on their way to this thread.
+    applied: u64,
     ghost: String,
     ghost_visible: bool,
+    /// What was typed along or accepted from the current completion, so that later tokens
+    /// do not show it again.
+    consumed: String,
     gen: u64,
     cancel: CancellationToken,
     pending: bool,
@@ -228,6 +235,8 @@ struct App {
     style: GhostStyle,
     last_exe: String,
     last_hwnd: isize,
+    /// `FocusInfo::element` of the last field seen, 0 when unknown.
+    last_element: u64,
     in_terminal: bool,
 }
 
@@ -392,8 +401,12 @@ impl App {
         self.swallow.set_ghost_visible(false);
         self.cancel.cancel();
         self.cancel = CancellationToken::new();
+        // Tokens already on their way belong to the cancelled completion.
+        self.gen += 1;
     }
 
+    /// Takes the field's text as the shadow. Not while keys are on their way to this thread:
+    /// the field already shows them, and their events would add them a second time.
     fn resync(&mut self) {
         self.cancel_ghost();
         self.pending = false;
@@ -401,10 +414,17 @@ impl App {
             self.shadow.reset_unknown();
             return;
         }
+        self.shadow.reset_unknown();
+        if self.keys_in_flight() {
+            self.resync_at = Some(Instant::now() + Duration::from_millis(50));
+            return;
+        }
         if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
-            self.shadow.reset(&t);
-        } else {
-            self.shadow.reset_unknown();
+            if self.keys_in_flight() {
+                self.resync_at = Some(Instant::now() + Duration::from_millis(50));
+            } else {
+                self.shadow.reset(&fixgate::field_text(&t));
+            }
         }
     }
 
@@ -415,6 +435,30 @@ impl App {
         self.shadow.reset_unknown();
         self.prev_boundary = None;
         self.resync_at = Some(Instant::now() + Duration::from_millis(150));
+    }
+
+    /// Keys or clicks have reached the app whose events this thread has not handled yet.
+    fn keys_in_flight(&self) -> bool {
+        self.swallow.passed() > self.applied
+    }
+
+    /// Takes the field's text as the shadow when it ends with what the shadow says was typed.
+    /// A field that only lags behind leaves the shadow alone; one that disagrees changed
+    /// behind the shadow's back, so it is read again once things settle.
+    fn adopt_field_text(&mut self) {
+        let Some(field) = cc_context::text_before_caret(CONTEXT_CHARS) else { return };
+        if self.keys_in_flight() {
+            return;
+        }
+        let field = fixgate::field_text(&field);
+        match fixgate::compare(&field, self.shadow.text()) {
+            fixgate::Tail::Same => self.shadow.reset(&field),
+            fixgate::Tail::Behind => {}
+            fixgate::Tail::Different => {
+                log::debug!("field text differs from the shadow; reading it again");
+                self.resync_soon();
+            }
+        }
     }
 
     fn field_allowed(&mut self) -> bool {
@@ -429,6 +473,12 @@ impl App {
                     self.last_hwnd = fi.hwnd;
                     // A different window means the shadow buffer describes the wrong field.
                     self.shadow.reset_unknown();
+                } else if fi.element != 0 && self.last_element != 0 && fi.element != self.last_element {
+                    // Another input of the same window, such as the next field of a web form.
+                    self.shadow.reset_unknown();
+                }
+                if fi.element != 0 {
+                    self.last_element = fi.element;
                 }
                 self.in_terminal = TERMINAL_EXES.contains(&fi.exe.as_str());
                 if let Some(why) = self.policy.denies(&fi.exe, &cc_context::window_title()) {
@@ -447,17 +497,15 @@ impl App {
 
     fn request_completion(&mut self) {
         self.pending = false;
+        if self.keys_in_flight() {
+            self.pending = true;
+            return;
+        }
         if !self.field_allowed() {
             return;
         }
-        // UIA text is authoritative once it has caught up with what we typed or injected;
-        // right after an injection it can still be short, so the shadow buffer wins then.
         if !self.in_terminal {
-            if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
-                if t.len() >= self.shadow.text().len() {
-                    self.shadow.reset(&t);
-                }
-            }
+            self.adopt_field_text();
         }
         let ctx = self.shadow.text().to_string();
         if ctx.trim().split_whitespace().count() < 2 {
@@ -488,6 +536,7 @@ impl App {
         let ctx = trimmed.to_string();
         self.heal = heal;
         self.raw.clear();
+        self.consumed.clear();
         self.tok_count = 0;
         self.logprob_sum = 0.0;
         // Recently accepted sentences in this app give the base model your voice.
@@ -517,14 +566,22 @@ impl App {
         }
     }
 
-    fn accept(&mut self, whole: bool) {
+    /// Types the ghost, or its next word unless `whole`. False when there is none.
+    fn accept(&mut self, whole: bool) -> bool {
         if self.ghost.is_empty() {
-            return;
+            return false;
         }
         // Hide first so the hook stops swallowing Tab/Esc while the text goes in.
         self.overlay.hide();
         self.ghost_visible = false;
         self.swallow.set_ghost_visible(false);
+        // A key that reached the app after the Tab would put the text in the wrong place.
+        if !self.swallow.begin_capture(self.applied) {
+            log::debug!("completion not inserted: typed ahead of it");
+            self.cancel_ghost();
+            self.pending = true;
+            return true;
+        }
         if let Some(id) = self.pending_completion_event.take() {
             self.outcome(id, Outcome::Accepted);
         }
@@ -542,17 +599,19 @@ impl App {
             head
         };
         log::debug!("inject {text:?}");
-        self.swallow.set_capture(true);
         let result = if use_paste() { cc_inject::paste_text(&text) } else { cc_inject::type_text(&text) };
         self.end_capture();
         if let Err(e) = result {
             log::warn!("inject failed: {e:#}");
+            self.resync_soon();
+            return true;
         }
         for c in text.chars() {
             self.shadow.push(c);
         }
         let more = !self.ghost.is_empty();
         if more {
+            self.consumed.push_str(&text);
             self.show_ghost();
         } else {
             self.cancel_ghost();
@@ -563,6 +622,7 @@ impl App {
             self.last_key = Instant::now() + settle;
             self.pending = true;
         }
+        true
     }
 
     /// Runs after the word before `boundary` is closed. Auto-applies one candidate that the
@@ -643,6 +703,7 @@ impl App {
         let mut typed = c.replacement.clone();
         typed.push(boundary);
         let del = c.original.chars().count() + 1;
+        let captured_before = self.swallow.captured();
         if !self.replace_tail(del, &typed) {
             return;
         }
@@ -676,11 +737,14 @@ impl App {
             let w = (typed.chars().count() as f32 * self.style.font_px * 0.55) as i32;
             self.overlay.show_underline(cc_overlay::Rect { x: r.x - w, y: r.y, w, h: r.h }, UNDERLINE_FADE_MS);
         }
-        self.swallow.set_revert_until(cc_hook::now_ms() + REVERT_WINDOW_MS);
         if let Some((id, _, _)) = self.pending_fix_event.replace((event_id, Instant::now(), self.shadow.text().chars().count())) {
             self.outcome(id, Outcome::Kept);
         }
-        self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary, event_id });
+        // Keys typed while the fix went in come after it, so Backspace then is a Backspace.
+        if self.swallow.captured() == captured_before {
+            self.swallow.set_revert_until(cc_hook::now_ms() + REVERT_WINDOW_MS);
+            self.last_fix = Some(Fix { original: c.original, replacement: c.replacement, boundary, event_id });
+        }
     }
 
     /// If the user went back over the previous word and retyped it as a near variant, the
@@ -713,10 +777,14 @@ impl App {
     /// Deletes `del` chars before the caret and types `typed`, keeping the shadow in step.
     fn replace_tail(&mut self, del: usize, typed: &str) -> bool {
         let gap = Duration::from_millis(fix_key_gap_ms());
-        // Capture the user's keys for the duration, and let the boundary key that triggered
-        // us settle in the target before deleting behind it.
-        self.swallow.set_capture(true);
-        let passed = self.swallow.passed();
+        // Capture the user's keys for the duration. A key or click that already reached the
+        // app after the one being handled means the field no longer ends where the shadow does.
+        if !self.swallow.begin_capture(self.applied) {
+            log::info!("fix not applied: typed ahead of it");
+            return false;
+        }
+        let passed = self.applied;
+        // Let the boundary key that triggered us settle in the target before deleting behind it.
         std::thread::sleep(Duration::from_millis(fix_pre_delay_ms()));
         // Ctrl, Alt or Win held would turn Backspace into delete-word or a shortcut, and a key
         // or click that got past the capture may have moved the caret: either way the planned
@@ -782,7 +850,7 @@ impl App {
                 self.replay_at = Some(now);
             }
         }
-        self.swallow.set_capture(false);
+        self.swallow.end_capture();
         self.capture_deadline = None;
     }
 
@@ -835,7 +903,7 @@ impl App {
                     HookEvent::Char(c)
                 }
             };
-            self.on_key(ev);
+            self.on_key(self.applied, ev);
         }
     }
 
@@ -868,12 +936,22 @@ impl App {
         log::info!("reverted {:?} -> {:?}", fix.replacement, fix.original);
     }
 
-    fn on_key(&mut self, ev: HookEvent) {
-        log::trace!("key {ev:?} ghost_visible={} ghost={:?}", self.ghost_visible, self.ghost);
+    /// `seq`: how many keys and clicks had reached the app with this event; events replayed
+    /// from a capture pass `self.applied`.
+    fn on_key(&mut self, seq: u64, ev: HookEvent) {
+        log::trace!("key #{seq} {ev:?} ghost_visible={} ghost={:?}", self.ghost_visible, self.ghost);
+        // The event's own key went to the app (Tab and Esc reach it only with no ghost).
+        let reached_app = seq > self.applied;
+        // A skipped number is input that reached the app with no event: a dead key, another
+        // program's keys, an event lost on the way.
+        let unseen = seq > self.applied + 1;
+        self.applied = self.applied.max(seq);
         if let HookEvent::Captured(c) = ev {
-            // The hook swallowed it, so it is replayed even while paused.
+            // The hook swallowed it, so it is replayed even while paused. It comes after
+            // whatever was going in, so that can no longer be undone with Backspace.
             self.captured_seen += 1;
             self.replay.push(c);
+            self.last_fix = None;
             return;
         }
         if !self.active() {
@@ -881,6 +959,10 @@ impl App {
             self.cancel_ghost();
             self.shadow.reset_unknown();
             return;
+        }
+        if unseen {
+            log::debug!("input reached the app without an event; reading the field again");
+            self.resync_soon();
         }
         self.last_key = Instant::now();
         let modifier_only = matches!(ev, HookEvent::Other(vk) if is_modifier_vk(vk));
@@ -899,6 +981,7 @@ impl App {
                 }
                 if self.ghost_visible && self.ghost.starts_with(c) {
                     self.ghost.remove(0);
+                    self.consumed.push(c);
                     if self.ghost.trim().is_empty() {
                         self.cancel_ghost();
                         self.pending = true;
@@ -927,11 +1010,22 @@ impl App {
                 self.cancel_ghost();
                 self.pending = true;
             }
-            HookEvent::Tab => self.accept(true),
-            HookEvent::CtrlTab => self.accept(false),
-            HookEvent::Esc => self.cancel_ghost(),
+            HookEvent::Tab | HookEvent::CtrlTab => {
+                // A Tab the hook let through went to the app, so focus may have moved.
+                if reached_app || !self.accept(ev == HookEvent::Tab) {
+                    self.cancel_ghost();
+                    self.resync_soon();
+                }
+            }
+            HookEvent::Esc => {
+                self.cancel_ghost();
+                if reached_app {
+                    self.resync_soon();
+                }
+            }
             HookEvent::Other(vk) if is_modifier_vk(vk) => {}
-            HookEvent::Left | HookEvent::Right | HookEvent::Nav | HookEvent::Other(_) => self.resync(),
+            // The app moves the caret or edits the text only once it has handled the key.
+            HookEvent::Left | HookEvent::Right | HookEvent::Nav | HookEvent::Other(_) => self.resync_soon(),
             HookEvent::RevertRequested => self.revert_fix(),
             HookEvent::Click => self.resync_soon(),
             HookEvent::Captured(_) => {}
@@ -986,6 +1080,12 @@ impl App {
             self.cancel_ghost();
             return;
         };
+        // What was typed along or accepted from this completion is no longer ghost text.
+        let Some(ghost) = ghost.strip_prefix(self.consumed.as_str()).map(str::to_string) else {
+            log::debug!("completion no longer matches what was typed: {:?}", self.raw);
+            self.cancel_ghost();
+            return;
+        };
         if ghost.trim().is_empty() {
             return;
         }
@@ -1002,7 +1102,10 @@ impl App {
             return; // not enough evidence yet; keep accumulating silently
         }
         self.ghost = ghost;
-        self.show_ghost();
+        // The next key decides whether this ghost stays; not worth UIA calls before that.
+        if !self.keys_in_flight() {
+            self.show_ghost();
+        }
     }
 
     fn on_done(&mut self, gen: u64, result: anyhow::Result<Completion>) {
@@ -1251,7 +1354,11 @@ impl App {
             let now = Instant::now();
             if now >= check.give_up || check.hwnd != self.last_hwnd {
                 self.fix_check = None;
-            } else if now >= check.due && self.last_key.elapsed() >= DEBOUNCE && self.replay_at.is_none() {
+            } else if now >= check.due
+                && self.last_key.elapsed() >= DEBOUNCE
+                && self.replay_at.is_none()
+                && !self.keys_in_flight()
+            {
                 self.fix_check = None;
                 self.verify_field(check.hwnd);
             }
@@ -1271,7 +1378,7 @@ impl App {
 fn run(rx: Receiver<Msg>, mut app: App) {
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Msg::Key(ev)) => app.on_key(ev),
+            Ok(Msg::Key(seq, ev)) => app.on_key(seq, ev),
             Ok(Msg::Token { gen, text, logprob }) => app.on_token(gen, text, logprob),
             Ok(Msg::Done { gen, result }) => app.on_done(gen, result),
             Err(RecvTimeoutError::Timeout) => {}
@@ -1371,15 +1478,15 @@ fn start() -> anyhow::Result<()> {
     let overlay = Overlay::new().context("overlay")?;
     let swallow = Arc::new(SwallowState::default());
 
-    let (ktx, krx) = unbounded::<HookEvent>();
+    let (ktx, krx) = unbounded::<cc_hook::Stamped>();
     let _hook = cc_hook::start(ktx, swallow.clone()).context("keyboard hook")?;
     {
         let tx = tx.clone();
         std::thread::Builder::new()
             .name("cc-keyfwd".into())
             .spawn(move || {
-                for ev in krx {
-                    if tx.send(Msg::Key(ev)).is_err() {
+                for (seq, ev) in krx {
+                    if tx.send(Msg::Key(seq, ev)).is_err() {
                         break;
                     }
                 }
@@ -1476,8 +1583,10 @@ fn start() -> anyhow::Result<()> {
         dont_touch: HashSet::new(),
         reverts: HashMap::new(),
         shadow: ShadowBuffer::new(),
+        applied: 0,
         ghost: String::new(),
         ghost_visible: false,
+        consumed: String::new(),
         gen: 0,
         cancel: CancellationToken::new(),
         pending: false,
@@ -1490,6 +1599,7 @@ fn start() -> anyhow::Result<()> {
         style: GhostStyle::default(),
         last_exe: String::new(),
         last_hwnd: 0,
+        last_element: 0,
         in_terminal: false,
     };
     if let Err(e) = app.start_engine(&model_id) {

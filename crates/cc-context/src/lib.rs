@@ -77,6 +77,9 @@ pub struct Rect { pub x: i32, pub y: i32, pub w: i32, pub h: i32 }
 #[derive(Debug, Clone)]
 pub struct FocusInfo {
     pub hwnd: isize,
+    /// The focused element's UIA RuntimeId folded into one number, 0 when unknown. It tells
+    /// apart the inputs of one window, which share its handle (every field of a web page).
+    pub element: u64,
     pub exe: String,
     pub is_password: bool,
     pub is_editable: bool,
@@ -194,6 +197,7 @@ pub fn focus_info() -> Option<FocusInfo> {
             let el = ok("GetFocusedElement", uia.GetFocusedElement())?;
             let ct = ok("CurrentControlType", el.CurrentControlType())?;
             let is_password = ok("CurrentIsPassword", el.CurrentIsPassword())?.as_bool();
+            let element = element_id(&el);
             let hwnd = ok("CurrentNativeWindowHandle", el.CurrentNativeWindowHandle())
                 .filter(|h| !h.0.is_null())
                 .unwrap_or(fg);
@@ -214,15 +218,15 @@ pub fn focus_info() -> Option<FocusInfo> {
             } else {
                 None
             };
-            Some((hwnd, ct.0, is_password, is_editable, real_exe))
+            Some((hwnd, element, ct.0, is_password, is_editable, real_exe))
         });
 
         Some(match uia_part {
-            Some((hwnd, ct, is_password, is_editable, real_exe)) => {
+            Some((hwnd, element, ct, is_password, is_editable, real_exe)) => {
                 if let Some(e) = real_exe {
                     exe = e;
                 }
-                FocusInfo { hwnd: hwnd.0 as isize, exe, is_password, is_editable, control_type: Some(ct) }
+                FocusInfo { hwnd: hwnd.0 as isize, element, exe, is_password, is_editable, control_type: Some(ct) }
             }
             None => {
                 let focus = gui_thread_info(tid)
@@ -231,6 +235,7 @@ pub fn focus_info() -> Option<FocusInfo> {
                     .unwrap_or(fg);
                 FocusInfo {
                     hwnd: focus.0 as isize,
+                    element: 0,
                     exe,
                     is_password: win32_is_password(focus),
                     is_editable: false,
@@ -533,8 +538,30 @@ unsafe fn bounding_rects(range: &IUIAutomationTextRange) -> Option<Vec<Rect>> {
 }
 
 unsafe fn read_f64_safearray(psa: *const SAFEARRAY) -> Option<Vec<f64>> {
-    if (*psa).cDims != 1 || (*psa).cbElements != 8 {
-        log::debug!("GetBoundingRectangles: unexpected SAFEARRAY shape");
+    read_safearray(psa, "GetBoundingRectangles")
+}
+
+/// `el.GetRuntimeId()` hashed (FNV-1a), 0 when the provider gives none.
+unsafe fn element_id(el: &IUIAutomationElement) -> u64 {
+    let Some(psa) = ok("GetRuntimeId", el.GetRuntimeId()) else { return 0 };
+    if psa.is_null() {
+        return 0;
+    }
+    let ids = read_safearray::<i32>(psa, "GetRuntimeId");
+    if let Err(e) = SafeArrayDestroy(psa) {
+        log::debug!("SafeArrayDestroy failed: {e}");
+    }
+    ids.map_or(0, |ids| {
+        ids.iter().flat_map(|id| id.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    })
+}
+
+/// The elements of a one-dimensional SAFEARRAY of `T`.
+unsafe fn read_safearray<T: Copy>(psa: *const SAFEARRAY, what: &str) -> Option<Vec<T>> {
+    if (*psa).cDims != 1 || (*psa).cbElements as usize != std::mem::size_of::<T>() {
+        log::debug!("{what}: unexpected SAFEARRAY shape");
         return None;
     }
     let lb = ok("SafeArrayGetLBound", SafeArrayGetLBound(psa, 1))?;
@@ -548,7 +575,7 @@ unsafe fn read_f64_safearray(psa: *const SAFEARRAY) -> Option<Vec<f64>> {
     let vals = if data.is_null() {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(data as *const f64, n).to_vec()
+        std::slice::from_raw_parts(data as *const T, n).to_vec()
     };
     if let Err(e) = SafeArrayUnaccessData(psa) {
         log::debug!("SafeArrayUnaccessData failed: {e}");

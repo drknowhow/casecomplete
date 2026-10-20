@@ -12,6 +12,8 @@ const UNDO_LIMIT: usize = 2;
 pub const PAUSE: Duration = Duration::from_secs(60);
 /// Characters compared by [`same_tail`].
 const TAIL: usize = 32;
+/// Characters the field may lag behind the shadow and still count as [`Tail::Behind`].
+const LAG: usize = 8;
 
 /// Keys that end a word for auto-fix. An apostrophe or hyphen continues the word
 /// (`doesn't`, `e-mail`): fixing `doesn` at the apostrophe leaves `does't`.
@@ -88,6 +90,41 @@ pub fn reject(
 pub fn same_tail(field: &str, shadow: &str) -> bool {
     let (field, shadow) = (comparable(field), comparable(shadow));
     field.ends_with(&shadow[shadow.len().saturating_sub(TAIL)..])
+}
+
+/// Field text as UIA gives it, with characters nobody typed turned into spaces one for one,
+/// so lengths still match the shadow: U+FFFC stands for an embedded object (an image, a
+/// mention chip), and browsers keep a typed space as a no-break space.
+pub fn field_text(raw: &str) -> String {
+    raw.chars().map(|c| if matches!(c, '\u{FFFC}' | '\u{A0}' | '\u{202F}') { ' ' } else { c }).collect()
+}
+
+/// How the end of the field's text relates to the end of the shadow buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Tail {
+    Same,
+    /// The field is the shadow without its last few characters: UIA has not caught up.
+    Behind,
+    /// Something changed the text without the shadow seeing it.
+    Different,
+}
+
+pub fn compare(field: &str, shadow: &str) -> Tail {
+    if same_tail(field, shadow) {
+        return Tail::Same;
+    }
+    let chars: Vec<char> = shadow.chars().collect();
+    for k in 1..=LAG.min(chars.len()) {
+        let older: String = chars[..chars.len() - k].iter().collect();
+        // Too little left to tell a lagging field from a different one.
+        if comparable(&older).len() < TAIL / 2 {
+            break;
+        }
+        if same_tail(field, &older) {
+            return Tail::Behind;
+        }
+    }
+    Tail::Different
 }
 
 fn comparable(s: &str) -> Vec<char> {
@@ -293,6 +330,23 @@ mod tests {
         assert!(!same_tail("it does't work ", "it doesn't work "));
         assert!(!same_tail("medge ", "merge "));
         assert!(!same_tail("previousthe ", "previous the "));
+    }
+
+    #[test]
+    fn field_text_keeps_lengths_and_drops_what_was_never_typed() {
+        assert_eq!(field_text("a\u{FFFC}b\u{A0}c"), "a b c");
+        assert_eq!(field_text("plain").chars().count(), 5);
+    }
+
+    #[test]
+    fn compare_tells_a_lagging_field_from_a_changed_one() {
+        let shadow = "the quick brown fox jumps over the lazy dog";
+        assert_eq!(compare("Once more: the quick brown fox jumps over the lazy dog", shadow), Tail::Same);
+        assert_eq!(compare("the quick brown fox jumps over the lazy d", shadow), Tail::Behind);
+        assert_eq!(compare("the quick brown fox jumps over the lazydog", shadow), Tail::Different);
+        assert_eq!(compare("something else entirely", shadow), Tail::Different);
+        assert_eq!(compare("anything", ""), Tail::Same, "an empty shadow knows nothing");
+        assert_eq!(compare("ab", "abc"), Tail::Different, "too short to call it lag");
     }
 
     #[test]
