@@ -592,11 +592,15 @@ impl App {
         }
         let t0 = Instant::now();
         let n_chars = sentence.chars().count();
-        let candidate = match self.auto.lookup(&word) {
+        // The autocorrect list holds bare words: `(teh` looks up `teh`. A word with
+        // punctuation after it was already looked up when that punctuation was typed.
+        let core = word.trim_start_matches(|c: char| !c.is_alphanumeric());
+        let listed = if core.ends_with(char::is_alphanumeric) { self.auto.lookup(core) } else { None };
+        let candidate = match listed {
             Some(fix) => Some(cc_correct::Candidate {
-                start: n_chars - word.chars().count(),
+                start: n_chars - core.chars().count(),
                 end: n_chars,
-                original: word.clone(),
+                original: core.to_string(),
                 replacement: fix,
                 rule: "autocorrect".into(),
                 severity: Severity::S0,
@@ -683,21 +687,23 @@ impl App {
     /// pair becomes an autocorrect entry: that is how the list learns your own typos.
     fn learn_self_correction(&mut self, word: &str) {
         let Some((prev, prev_len)) = self.prev_boundary.take() else { return };
+        // Punctuation typed around a word is not part of the typo.
+        let (prev, word) = (fixgate::word_core(&prev), fixgate::word_core(word));
         let now_len = self.shadow.text().chars().count();
         if now_len > prev_len || prev == word || prev.chars().count() < 3 || word.chars().count() < 2 {
             return;
         }
-        if cc_correct::is_code_like(&prev) || cc_correct::is_code_like(word) || !self.checker.is_word(word, &self.dict) {
+        if cc_correct::is_code_like(prev) || cc_correct::is_code_like(word) || !self.checker.is_word(word, &self.dict) {
             return;
         }
         if cc_correct::edit_distance(&prev.to_lowercase(), &word.to_lowercase()) > 2 {
             return;
         }
-        let prev_is_unknown = self.checker.check(&prev, &self.dict).iter().any(|c| c.rule == "spell");
+        let prev_is_unknown = self.checker.check(prev, &self.dict).iter().any(|c| c.rule == "spell");
         if !prev_is_unknown {
             return;
         }
-        self.auto.add(&prev, word);
+        self.auto.add(prev, word);
         if let Err(e) = self.auto.save(&self.auto_path) {
             log::warn!("autocorrect save failed: {e}");
         }
@@ -1412,6 +1418,12 @@ fn start() -> anyhow::Result<()> {
     let ui = UiServer::start(&profile.join("events.db"), &profile, ui_state.clone(), ui_tx).context("ui server")?;
     let windows = Windows::new().context("ui windows")?;
     log::info!("dashboard: {}", ui.url("dashboard"));
+    let auto = AutocorrectList::load(&auto_path);
+    if auto.file_is_stale() {
+        if let Err(e) = auto.save(&auto_path) {
+            log::warn!("autocorrect save failed: {e}");
+        }
+    }
     let long_ago = Instant::now() - Duration::from_secs(24 * 3600);
     let mut app = App {
         store,
@@ -1448,7 +1460,7 @@ fn start() -> anyhow::Result<()> {
         last_status: long_ago,
         checker: Checker::new(),
         dict: PersonalDictionary::load(&dict_path),
-        auto: AutocorrectList::load(&auto_path),
+        auto,
         auto_path,
         prev_boundary: None,
         dict_path,

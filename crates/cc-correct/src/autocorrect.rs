@@ -13,30 +13,65 @@ const SEED: &str = include_str!("autocorrect_seed.txt");
 pub struct AutocorrectList {
     seed: HashMap<String, String>,
     user: HashMap<String, String>,
+    /// Loading the user file changed or dropped an entry, so the file is out of date.
+    stale_file: bool,
 }
 
-fn parse(text: &str) -> HashMap<String, String> {
-    text.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            if l.is_empty() || l.starts_with('#') {
-                return None;
+/// `typo` split into the punctuation before its letters, the letters, and the punctuation
+/// after them. None when it has no letters or digits.
+fn split_punctuation(typo: &str) -> Option<(&str, &str, &str)> {
+    let start = typo.find(char::is_alphanumeric)?;
+    let (last, c) = typo.char_indices().rev().find(|(_, c)| c.is_alphanumeric())?;
+    let end = last + c.len_utf8();
+    Some((&typo[..start], &typo[start..end], &typo[end..]))
+}
+
+/// A `typo -> fix` pair keyed by the bare typo, with the punctuation around the typo also
+/// taken off the fix: a learned `reeviews, -> reviews` would otherwise delete the comma.
+fn normalize(typo: &str, fix: &str) -> Option<(String, String)> {
+    let (lead, core, trail) = split_punctuation(typo.trim())?;
+    let fix = fix.trim();
+    let fix = fix.strip_prefix(lead).unwrap_or(fix);
+    let fix = fix.strip_suffix(trail).unwrap_or(fix).trim();
+    let key = core.to_lowercase();
+    (!fix.is_empty() && key != fix.to_lowercase()).then(|| (key, fix.to_string()))
+}
+
+/// The entries of `text`, and whether normalising changed or dropped any of them.
+fn parse(text: &str) -> (HashMap<String, String>, bool) {
+    let mut entries = HashMap::new();
+    let mut changed = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((typo, fix)) = line.split_once("->") else { continue };
+        match normalize(typo, fix) {
+            Some((key, clean)) => {
+                changed |= key != typo.trim().to_lowercase() || clean != fix.trim();
+                entries.insert(key, clean);
             }
-            let (k, v) = l.split_once("->")?;
-            Some((k.trim().to_lowercase(), v.trim().to_string()))
-        })
-        .filter(|(k, v)| !k.is_empty() && !v.is_empty() && k != &v.to_lowercase())
-        .collect()
+            None => changed = true,
+        }
+    }
+    (entries, changed)
 }
 
 impl AutocorrectList {
     /// Built-in seed plus `path` (`typo -> fix` per line); a missing file is fine.
     pub fn load(path: &Path) -> AutocorrectList {
-        let user = std::fs::read_to_string(path).map(|t| parse(&t)).unwrap_or_default();
-        AutocorrectList { seed: parse(SEED), user }
+        let (user, stale_file) = std::fs::read_to_string(path).map(|t| parse(&t)).unwrap_or_default();
+        AutocorrectList { seed: parse(SEED).0, user, stale_file }
     }
 
-    /// The fix for `word`, with the word's capitalisation carried over. User entries win.
+    /// The file `load` read had entries it had to clean up; `save` brings it up to date.
+    pub fn file_is_stale(&self) -> bool {
+        self.stale_file
+    }
+
+    /// The fix for `word` (a bare word, no punctuation around it), with the word's
+    /// capitalisation carried over. User entries win.
     pub fn lookup(&self, word: &str) -> Option<String> {
         let key = word.to_lowercase();
         let fix = self.user.get(&key).or_else(|| self.seed.get(&key))?;
@@ -49,12 +84,15 @@ impl AutocorrectList {
     }
 
     pub fn add(&mut self, typo: &str, fix: &str) {
-        self.user.insert(typo.to_lowercase(), fix.to_string());
+        if let Some((key, fix)) = normalize(typo, fix) {
+            self.user.insert(key, fix);
+        }
     }
 
     /// Removes a user entry and shadows a seed entry so it never fires again.
     pub fn remove(&mut self, typo: &str) {
-        let key = typo.to_lowercase();
+        let Some((_, core, _)) = split_punctuation(typo.trim()) else { return };
+        let key = core.to_lowercase();
         self.user.remove(&key);
         self.seed.remove(&key);
     }
@@ -112,6 +150,26 @@ mod tests {
         let mut again = again;
         again.remove("teh");
         assert_eq!(again.lookup("teh"), None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn punctuation_around_a_learned_typo_is_dropped_from_both_sides() {
+        let dir = std::env::temp_dir().join(format!("cc-auto-punct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("autocorrect.txt");
+        std::fs::write(&path, "(iof -> (if\nreeviews, -> reviews\nomw -> on my way!\n").unwrap();
+        let mut list = AutocorrectList::load(&path);
+        assert!(list.file_is_stale());
+        assert_eq!(list.lookup("iof").as_deref(), Some("if"));
+        assert_eq!(list.lookup("reeviews").as_deref(), Some("reviews"));
+        assert_eq!(list.lookup("omw").as_deref(), Some("on my way!"));
+        list.add("\"Wrod,", "\"word,");
+        assert_eq!(list.lookup("wrod").as_deref(), Some("word"));
+        list.save(&path).unwrap();
+        assert!(!AutocorrectList::load(&path).file_is_stale());
+        list.remove("reeviews,");
+        assert_eq!(list.lookup("reeviews"), None);
         std::fs::remove_dir_all(dir).ok();
     }
 }
