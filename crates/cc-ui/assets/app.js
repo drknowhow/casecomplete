@@ -98,7 +98,7 @@
     off: 'Nothing is changed for you.',
     S0: 'Obvious typos only.',
     S1: 'Typos and clear grammar slips.',
-    S2: 'Typos, grammar and style. Fixes more, so more get undone.',
+    S2: 'Typos and grammar, plus doubled letters in capitalised words such as Outllook.',
   };
 
   function modelOf(st) {

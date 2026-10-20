@@ -565,9 +565,10 @@ impl App {
         }
     }
 
-    /// Runs after the word before `boundary` is closed. Auto-applies one S0/S1 candidate that
-    /// spans exactly that word; anything else is left alone. Never runs after Enter, because
-    /// in chat fields the text has already been sent.
+    /// Runs after the word before `boundary` is closed. Auto-applies one candidate that the
+    /// auto-fix level allows (`fixgate::eligible`) and that replaces exactly that word;
+    /// anything else is left alone. Never runs after Enter, because in chat fields the text
+    /// has already been sent.
     fn on_word_boundary(&mut self, boundary: char) {
         let Some(level) = self.auto_level.clone() else { return };
         if self.breaker.paused(self.last_hwnd, Instant::now()) {
@@ -607,7 +608,7 @@ impl App {
                 .into_iter()
                 .find(|c| {
                     c.end == n_chars
-                        && c.severity <= level
+                        && fixgate::eligible(&c.severity, &c.rule, &c.original, &c.replacement, &level)
                         && sentence.ends_with(&c.original)
                         && !self.demoted.contains(&c.rule)
                 }),
@@ -619,9 +620,10 @@ impl App {
         // The fix deletes `original` back from the caret. Unless the shadow saw what precedes
         // it, that may be the tail of a longer word, and the result would be a mangled word.
         let whole_word = body_len > c.original.len() || self.shadow.anchored();
-        let taught = c.rule == "autocorrect" && self.auto.is_user_entry(&word);
+        let listed = c.rule == "autocorrect";
+        let taught = listed && self.auto.is_user_entry(&c.original);
         let is_word = |token: &str| taught || self.checker.is_word(token, &self.dict);
-        if let Some(why) = fixgate::reject(&c.original, &c.replacement, whole_word, is_word) {
+        if let Some(why) = fixgate::reject(&c.original, &c.replacement, whole_word, listed, is_word) {
             log::info!("fix {:?} -> {:?} [{}] not applied: {why}", c.original, c.replacement, c.rule);
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
