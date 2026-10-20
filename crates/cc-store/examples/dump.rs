@@ -1,7 +1,7 @@
 //! Print what the profile's `events.db` has learned so far.
 //!
 //! ```text
-//! cargo run -p cc-store --example dump [path\to\events.db]
+//! cargo run -p cc-store --example store_dump [path\to\events.db]
 //! ```
 //!
 //! Defaults to `%LOCALAPPDATA%\CaseComplete\profiles\default\events.db`.

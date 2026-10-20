@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Local web UI (flyout + dashboard) for the CaseComplete typing assistant"
 
+# Named `ui_demo` so that building several crates' examples in one cargo
+# invocation does not collide with cc-window's `demo` example.
+[[example]]
+name = "ui_demo"
+path = "examples/demo.rs"
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true

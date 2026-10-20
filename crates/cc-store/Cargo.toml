@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Named `store_dump` so that building several crates' examples in one cargo
+# invocation does not collide with cc-hook's `dump` example.
+[[example]]
+name = "store_dump"
+path = "examples/dump.rs"
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true
