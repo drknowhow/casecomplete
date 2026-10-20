@@ -16,7 +16,8 @@
 //! suggestion". Instead the candidates in Harper's wider suggestion pool are re-ranked with a
 //! small typing-error model (doubled keys, QWERTY-adjacent keys, transpositions, schwa vowels
 //! in `-er`/`-ar`, a common-word prior) and a typo is S0 only when the best candidate beats the
-//! runner-up by a clear margin. See [`Checker::analyze`] and the `typo_cost` function.
+//! runner-up by a clear margin and is one slip from what was typed: doubled keys, or a single
+//! edit that keeps the first letter. See [`Checker::analyze`] and the `typo_cost` function.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -477,6 +478,12 @@ impl Checker {
         // unknown word is probably a name: only a very common word may replace it automatically.
         let dialect_variant = self.dict.contains_word(&orig);
         let name_risk = first_upper && !common_words().contains(best.text.as_str());
+        // Past doubled keys, an automatic fix is one slip from what was typed and keeps its
+        // first letter. Two slips, or another first letter, leave other words as close:
+        // `calory` is `calorie` as much as `color`, and `this morth` means `month` though the
+        // keyboard favours `north`.
+        let one_slip = is_doubled_letter_typo(original, &best.text)
+            || (best.distance == 1 && keeps_first_letter(&lower, &best.text));
         let long_enough = orig.len() >= MIN_S0_LEN
             || (orig.len() >= 3
                 && is_doubled_letter_typo(original, &best.text)
@@ -485,6 +492,7 @@ impl Checker {
             && !name_risk
             && !looks_coined(&lower, &best.text)
             && long_enough
+            && one_slip
             && margin >= S0_MIN_MARGIN
             && confidence >= S0_MIN_CONFIDENCE
         {
@@ -503,7 +511,8 @@ impl Checker {
 const POOL_SIZE: usize = 200;
 /// Entries in the per-word classification memo before it is reset.
 const CACHE_LIMIT: usize = 4096;
-/// S0 needs a Damerau-Levenshtein distance of at most this.
+/// Candidates within this Damerau-Levenshtein distance are scored. S0 needs 1, or more only
+/// when every extra letter is a doubled key (`seentencees`).
 const S0_MAX_DISTANCE: usize = 2;
 /// S0 needs an original of at least this many chars, unless it is a common word with a
 /// doubled letter (`soo`). Shorter typos have several likely fixes: `har` is `her` or `has`.
@@ -726,7 +735,9 @@ fn common_word_typo(word: &str) -> Option<(String, f32)> {
     let mut scored = common_neighbours(word);
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
     let best = scored.first()?;
-    if len < MIN_S0_LEN && !is_doubled_letter_typo(word, best.1) {
+    let doubled = is_doubled_letter_typo(word, best.1);
+    let typed: Vec<char> = word.chars().map(lc).collect();
+    if (len < MIN_S0_LEN && !doubled) || !(doubled || keeps_first_letter(&typed, best.1)) {
         return None;
     }
     let margin = scored.get(1).map_or(f32::INFINITY, |second| second.0 - best.0);
@@ -744,6 +755,17 @@ fn looks_coined(typed: &[char], fix: &str) -> bool {
     let typed: String = typed.iter().collect();
     let fix: String = fix.iter().collect();
     no_vowel || (cut && !is_doubled_letter_typo(&typed, &fix))
+}
+
+/// `fix` starts with the letter typed first (`typed` is lowercase), or with the first two
+/// typed letters swapped (`htis` for `this`).
+fn keeps_first_letter(typed: &[char], fix: &str) -> bool {
+    let fix: Vec<char> = fix.chars().map(lc).collect();
+    match (typed, fix.as_slice()) {
+        ([a, ..], [b, ..]) if a == b => true,
+        ([a, b, ..], [c, d, ..]) => a == d && b == c,
+        _ => false,
+    }
 }
 
 fn lowercase_first(s: &str) -> String {
@@ -1224,6 +1246,24 @@ mod tests {
         }
         let c = checker().check("I want thatt", &dict).into_iter().find(|c| c.original == "thatt").unwrap();
         assert_eq!((c.replacement.as_str(), &c.severity), ("that", &Severity::S0), "a doubled last letter is a typo");
+    }
+
+    #[test]
+    fn auto_fixes_are_one_slip_that_keeps_the_first_letter() {
+        let dict = PersonalDictionary::default();
+        // Two slips (`calorie`, `color`) or another first letter (`month`, `north`): suggest only.
+        for (text, typo) in [("It is ok to use it for the calory count", "calory"), ("We check the traffic this morth", "morth")] {
+            let cands = checker().check(text, &dict);
+            assert!(
+                cands.iter().filter(|c| c.original == typo).all(|c| c.severity >= Severity::S2),
+                "{text}: {cands:?}"
+            );
+        }
+        // Swapping the first two letters is one slip.
+        let c = checker().check("I want htis one", &dict).into_iter().find(|c| c.original == "htis").unwrap();
+        assert_eq!((c.replacement.as_str(), &c.severity), ("this", &Severity::S0));
+        assert!(keeps_first_letter(&['h', 't', 'i', 's'], "this"));
+        assert!(!keeps_first_letter(&['m', 'o', 'r', 't', 'h'], "north"));
     }
 
     #[test]
