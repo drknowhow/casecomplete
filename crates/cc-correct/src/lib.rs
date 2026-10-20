@@ -483,6 +483,7 @@ impl Checker {
                 && common_words().contains(best.text.as_str()));
         if !dialect_variant
             && !name_risk
+            && !looks_coined(&lower, &best.text)
             && long_enough
             && margin >= S0_MIN_MARGIN
             && confidence >= S0_MIN_CONFIDENCE
@@ -731,6 +732,18 @@ fn common_word_typo(word: &str) -> Option<(String, f32)> {
     let margin = scored.get(1).map_or(f32::INFINITY, |second| second.0 - best.0);
     let confidence = 1.0 - 1.0 / len as f32;
     (margin >= S0_MIN_MARGIN && confidence >= S0_MIN_CONFIDENCE).then(|| (best.1.to_string(), confidence))
+}
+
+/// `typed` (lowercase) is more likely an abbreviation, code or a coined word than a typo of
+/// `fix`: it has no vowel at all (`htmlr`, `xlsx`), or it is `fix` with two or more letters
+/// added (`healthyep` for `healthy`), which a fix would cut off.
+fn looks_coined(typed: &[char], fix: &str) -> bool {
+    let no_vowel = !typed.iter().any(|&c| is_vowel(c) || c == 'y');
+    let fix: Vec<char> = fix.chars().map(lc).collect();
+    let cut = typed.len() >= fix.len() + 2 && typed.starts_with(&fix);
+    let typed: String = typed.iter().collect();
+    let fix: String = fix.iter().collect();
+    no_vowel || (cut && !is_doubled_letter_typo(&typed, &fix))
 }
 
 fn lowercase_first(s: &str) -> String {
@@ -1193,6 +1206,24 @@ mod tests {
             let c = cands.iter().find(|c| c.original == typo).unwrap_or_else(|| panic!("{text}: {cands:?}"));
             assert_eq!((c.replacement.as_str(), &c.severity), (fix, &Severity::S0), "{text}");
         }
+    }
+
+    #[test]
+    fn abbreviations_and_coined_words_are_not_auto_fixed() {
+        let dict = PersonalDictionary::default();
+        for (text, typo) in [
+            ("I wrote some htmlr", "htmlr"),
+            ("Open the xlsx file", "xlsx"),
+            ("Run the healthyep check", "healthyep"),
+        ] {
+            let cands = checker().check(text, &dict);
+            assert!(
+                cands.iter().filter(|c| c.original == typo).all(|c| c.severity >= Severity::S2),
+                "{text}: {cands:?}"
+            );
+        }
+        let c = checker().check("I want thatt", &dict).into_iter().find(|c| c.original == "thatt").unwrap();
+        assert_eq!((c.replacement.as_str(), &c.severity), ("that", &Severity::S0), "a doubled last letter is a typo");
     }
 
     #[test]
