@@ -25,7 +25,7 @@ use cc_correct::{AutocorrectList, Checker, PersonalDictionary, Severity};
 use cc_engine::{Completion, CompletionClient, Sidecar};
 use cc_hook::{HookEvent, ShadowBuffer, SwallowState};
 use cc_overlay::{GhostStyle, Overlay};
-use cc_store::{Action, NewEvent, Outcome, Source, Store};
+use cc_store::{Action, Landing, NewEvent, Outcome, Source, Store};
 use cc_tray::{Tray, TrayEvent, TrayState};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +44,10 @@ const TUNE_EVERY: Duration = Duration::from_secs(6 * 3600);
 const STATUS_EVERY: Duration = Duration::from_secs(60);
 const STYLE_EVERY: Duration = Duration::from_secs(300);
 const UNDERLINE_FADE_MS: u32 = 1500;
+/// A fix that reads back wrong is read again this many times before it counts as failed:
+/// Electron apps can take a while to update what UIA sees.
+const FIX_CHECK_RETRIES: u8 = 2;
+const FIX_RECHECK_AFTER: Duration = Duration::from_millis(200);
 const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
 /// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
 /// is the only context and editability is assumed.
@@ -105,8 +109,11 @@ struct Fix {
 #[derive(Clone, Copy)]
 struct FixCheck {
     hwnd: isize,
+    event_id: i64,
     due: Instant,
     give_up: Instant,
+    /// Reads so far that disagreed with the shadow.
+    tries: u8,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -237,6 +244,11 @@ struct App {
     last_hwnd: isize,
     /// `FocusInfo::element` of the last field seen, 0 when unknown.
     last_element: u64,
+    /// The window whose field last gave its text through UIA. Once a field has, a fix there
+    /// is typed only after reading that the field ends with the word.
+    text_hwnd: isize,
+    /// How fixes landed per app (`Store::landing`), cached; refreshed with each check.
+    landing: HashMap<String, Landing>,
     in_terminal: bool,
 }
 
@@ -420,6 +432,7 @@ impl App {
             return;
         }
         if let Some(t) = cc_context::text_before_caret(CONTEXT_CHARS) {
+            self.text_hwnd = self.last_hwnd;
             if self.keys_in_flight() {
                 self.resync_at = Some(Instant::now() + Duration::from_millis(50));
             } else {
@@ -447,6 +460,7 @@ impl App {
     /// behind the shadow's back, so it is read again once things settle.
     fn adopt_field_text(&mut self) {
         let Some(field) = cc_context::text_before_caret(CONTEXT_CHARS) else { return };
+        self.text_hwnd = self.last_hwnd;
         if self.keys_in_flight() {
             return;
         }
@@ -631,7 +645,7 @@ impl App {
     /// has already been sent.
     fn on_word_boundary(&mut self, boundary: char) {
         let Some(level) = self.auto_level.clone() else { return };
-        if self.breaker.paused(self.last_hwnd, Instant::now()) {
+        if self.breaker.paused(self.last_hwnd, Instant::now()) || self.landing_too_low() {
             return;
         }
         let text = self.shadow.text();
@@ -702,15 +716,11 @@ impl App {
         let caret = cc_context::caret_rect();
         let mut typed = c.replacement.clone();
         typed.push(boundary);
-        let del = c.original.chars().count() + 1;
+        let mut delete = c.original.clone();
+        delete.push(boundary);
         let captured_before = self.swallow.captured();
-        if !self.replace_tail(del, &typed) {
+        if !self.replace_tail(&delete, &typed) {
             return;
-        }
-        if !self.in_terminal {
-            let now = Instant::now();
-            let due = now + inject_settle(del + typed.chars().count());
-            self.fix_check = Some(FixCheck { hwnd: self.last_hwnd, due, give_up: now + Duration::from_secs(3) });
         }
         let event_id = self
             .store
@@ -733,6 +743,12 @@ impl App {
                 log::warn!("store log failed: {e:#}");
                 0
             });
+        if !self.in_terminal {
+            let now = Instant::now();
+            let due = now + inject_settle(delete.chars().count() + typed.chars().count());
+            let give_up = now + Duration::from_secs(3);
+            self.fix_check = Some(FixCheck { hwnd: self.last_hwnd, event_id, due, give_up, tries: 0 });
+        }
         if let Some(r) = caret {
             let w = (typed.chars().count() as f32 * self.style.font_px * 0.55) as i32;
             self.overlay.show_underline(cc_overlay::Rect { x: r.x - w, y: r.y, w, h: r.h }, UNDERLINE_FADE_MS);
@@ -774,8 +790,9 @@ impl App {
         log::info!("learned {:?} -> {:?}", prev, word);
     }
 
-    /// Deletes `del` chars before the caret and types `typed`, keeping the shadow in step.
-    fn replace_tail(&mut self, del: usize, typed: &str) -> bool {
+    /// Deletes `delete` from before the caret and types `typed`, keeping the shadow in step.
+    fn replace_tail(&mut self, delete: &str, typed: &str) -> bool {
+        let del = delete.chars().count();
         let gap = Duration::from_millis(fix_key_gap_ms());
         // Capture the user's keys for the duration. A key or click that already reached the
         // app after the one being handled means the field no longer ends where the shadow does.
@@ -796,6 +813,11 @@ impl App {
         }
         if cc_inject::shortcut_modifier_held() || self.swallow.passed() != passed {
             log::info!("fix not applied: a shortcut key is held or the caret may have moved");
+            self.end_capture();
+            return false;
+        }
+        if !self.in_terminal && !self.field_ends_with(delete) {
+            log::info!("fix not applied: the field does not end with the word");
             self.end_capture();
             return false;
         }
@@ -824,6 +846,18 @@ impl App {
         self.last_key = Instant::now() + inject_settle(del + typed.chars().count());
         self.pending = true;
         true
+    }
+
+    /// Whether the text before the caret ends with `delete` (`fixgate::ready_for`). A field
+    /// that has never given its text through UIA has only the shadow to go by.
+    fn field_ends_with(&mut self, delete: &str) -> bool {
+        match cc_context::text_before_caret(CONTEXT_CHARS) {
+            Some(field) => {
+                self.text_hwnd = self.last_hwnd;
+                fixgate::ready_for(&field, delete)
+            }
+            None => self.text_hwnd != self.last_hwnd,
+        }
     }
 
     /// Captured keys are replayed on a later tick, once the hook thread has delivered them.
@@ -864,22 +898,71 @@ impl App {
         }
     }
 
-    /// The field must end with what the shadow buffer says was typed. If it does not, a fix
-    /// went somewhere else: auto-fix pauses in this window and the field's text is taken as
-    /// the truth.
-    fn verify_field(&mut self, hwnd: isize) {
+    /// The field must end with what the shadow buffer says was typed. A read that disagrees
+    /// is repeated, since UIA can lag. If it still disagrees, the fix went somewhere else:
+    /// auto-fix pauses in this window, the field is read again once quiet, and the miss
+    /// counts against the app.
+    fn verify_field(&mut self, check: FixCheck) {
         let Some(field) = cc_context::text_before_caret(CONTEXT_CHARS) else { return };
+        if self.keys_in_flight() {
+            self.fix_check = Some(check);
+            return;
+        }
+        self.text_hwnd = self.last_hwnd;
+        let field = fixgate::field_text(&field);
         if fixgate::same_tail(&field, self.shadow.text()) {
+            self.record_fix_check(check.event_id, true);
+            return;
+        }
+        if check.tries < FIX_CHECK_RETRIES {
+            let due = Instant::now() + FIX_RECHECK_AFTER;
+            self.fix_check = Some(FixCheck { due, tries: check.tries + 1, ..check });
             return;
         }
         log::warn!(
-            "fix check failed in {}: the field does not end with the typed text; auto-fix paused for {}s",
+            "fix check failed in {}: the field ends {:?} where {:?} was typed; auto-fix paused for {}s",
             self.last_exe,
+            fixgate::shape(&field),
+            fixgate::shape(self.shadow.text()),
             fixgate::PAUSE.as_secs()
         );
-        self.breaker.trip(hwnd, Instant::now());
+        self.record_fix_check(check.event_id, false);
+        self.breaker.trip(check.hwnd, Instant::now());
         self.tray.set_status("Auto-fix paused here for a minute: a fix did not land as expected");
-        self.shadow.reset(&field);
+        self.resync_soon();
+    }
+
+    /// Stores whether a fix read back as typed, and reports when that turns auto-fix off in
+    /// the app (`Landing::too_low`).
+    fn record_fix_check(&mut self, event_id: i64, landed: bool) {
+        if let Err(e) = self.store.log_fix_check(event_id, &self.last_exe, landed) {
+            log::warn!("store fix check failed: {e:#}");
+            return;
+        }
+        let was_low = self.landing.get(&self.last_exe).is_some_and(Landing::too_low);
+        match self.store.landing(&self.last_exe) {
+            Ok(l) => {
+                if l.too_low() && !was_low {
+                    let line = format!(
+                        "Auto-fix is off in {}: {} of its last {} fixes did not land as typed",
+                        self.last_exe, l.failed, l.checked
+                    );
+                    log::warn!("{line}");
+                    self.tray.set_status(&line);
+                }
+                self.landing.insert(self.last_exe.clone(), l);
+            }
+            Err(e) => log::warn!("landing failed: {e:#}"),
+        }
+    }
+
+    /// Auto-fix is off in the focused app because too many of its fixes landed wrong.
+    fn landing_too_low(&mut self) -> bool {
+        if !self.landing.contains_key(&self.last_exe) {
+            let l = self.store.landing(&self.last_exe).unwrap_or_default();
+            self.landing.insert(self.last_exe.clone(), l);
+        }
+        self.landing.get(&self.last_exe).is_some_and(Landing::too_low)
     }
 
     fn flush_replay(&mut self) {
@@ -913,7 +996,9 @@ impl App {
         self.cancel_ghost();
         let mut typed = fix.original.clone();
         typed.push(fix.boundary);
-        if !self.replace_tail(fix.replacement.chars().count() + 1, &typed) {
+        let mut delete = fix.replacement.clone();
+        delete.push(fix.boundary);
+        if !self.replace_tail(&delete, &typed) {
             return;
         }
         let n = self.reverts.entry(fix.original.clone()).or_insert(0);
@@ -1286,6 +1371,8 @@ impl App {
 
     fn run_tuning(&mut self) {
         self.last_tune = Instant::now();
+        // Week-old fix checks age out, which can give an app its auto-fix back.
+        self.landing.clear();
         match self.store.expire_pending(24 * 3600 * 1000) {
             Ok(n) if n > 0 => log::info!("expired {n} pending events"),
             Err(e) => log::warn!("expire failed: {e:#}"),
@@ -1360,7 +1447,7 @@ impl App {
                 && !self.keys_in_flight()
             {
                 self.fix_check = None;
-                self.verify_field(check.hwnd);
+                self.verify_field(check);
             }
         }
         if self.resync_at.is_some_and(|t| Instant::now() >= t) {
@@ -1600,6 +1687,8 @@ fn start() -> anyhow::Result<()> {
         last_exe: String::new(),
         last_hwnd: 0,
         last_element: 0,
+        text_hwnd: 0,
+        landing: HashMap::new(),
         in_terminal: false,
     };
     if let Err(e) = app.start_engine(&model_id) {

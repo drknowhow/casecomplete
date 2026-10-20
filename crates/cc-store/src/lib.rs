@@ -33,6 +33,24 @@ const MAX_CONTEXT_CHARS: usize = 200;
 const DEMOTE_MIN_AUTO: u64 = 20;
 /// Minimum suggestions before a promotion can be offered.
 const PROMOTE_MIN_SUGGESTED: u64 = 50;
+/// How many of an app's latest fix checks [`Store::landing`] counts.
+const LANDING_WINDOW: u32 = 50;
+/// Checks an app needs before [`Landing::too_low`] can say it does not take fixes cleanly.
+const LANDING_MIN_CHECKS: u64 = 20;
+/// Checks older than this are forgotten, so an app gets auto-fix back after a quiet week.
+const LANDING_MAX_AGE_MS: i64 = 7 * 86_400_000;
+
+/// Tables added after version 1. Each is created if missing on every open instead of
+/// bumping `SCHEMA_VERSION`, so an older build can still open the file and ignores them.
+const SCHEMA_ADDED: &str = "
+CREATE TABLE IF NOT EXISTS fix_checks(
+    event_id INTEGER NOT NULL,
+    ts       INTEGER NOT NULL,
+    app_exe  TEXT    NOT NULL,
+    landed   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fix_checks_app ON fix_checks(app_exe COLLATE NOCASE, ts);
+";
 
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS events(
@@ -232,6 +250,21 @@ pub struct AppStat {
     pub shown: u64,
     /// Completions accepted.
     pub accepted: u64,
+}
+
+/// How an app's latest auto-fixes landed when read back from the field ([`Store::landing`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Landing {
+    pub checked: u64,
+    /// Read back different from what was typed.
+    pub failed: u64,
+}
+
+impl Landing {
+    /// More than one in fifty fixes went wrong, over enough fixes to tell.
+    pub fn too_low(&self) -> bool {
+        self.checked >= LANDING_MIN_CHECKS && self.failed * 50 > self.checked
+    }
 }
 
 /// One confidence decile of [`Store::by_confidence`].
@@ -730,6 +763,26 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Records whether the auto-fix `event_id` read back from the field as typed.
+    pub fn log_fix_check(&self, event_id: i64, app_exe: &str, landed: bool) -> Result<()> {
+        self.conn
+            .prepare_cached("INSERT INTO fix_checks(event_id, ts, app_exe, landed) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![event_id, now_ms(), app_exe, landed])?;
+        Ok(())
+    }
+
+    /// The newest [`LANDING_WINDOW`] fix checks in `app_exe` from the last week.
+    pub fn landing(&self, app_exe: &str) -> Result<Landing> {
+        let since = now_ms() - LANDING_MAX_AGE_MS;
+        let (checked, failed) = self.conn.prepare_cached(
+            "SELECT COUNT(*), COUNT(CASE WHEN landed = 0 THEN 1 END) FROM ( \
+               SELECT landed FROM fix_checks WHERE app_exe = ?1 COLLATE NOCASE AND ts >= ?2 \
+               ORDER BY ts DESC LIMIT ?3)",
+        )?
+        .query_row(params![app_exe, since, LANDING_WINDOW], |r| Ok((cnt(r.get(0)?), cnt(r.get(1)?))))?;
+        Ok(Landing { checked, failed })
+    }
+
     /// Rules currently capped at "suggest" (see [`Store::tune`]), sorted by name.
     pub fn demoted_rules(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare_cached(
@@ -757,6 +810,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if current < 1 {
         tx.execute_batch(SCHEMA_V1)?;
     }
+    tx.execute_batch(SCHEMA_ADDED)?;
     if current < SCHEMA_VERSION {
         tx.execute("DELETE FROM schema_version", [])?;
         tx.execute("INSERT INTO schema_version(version) VALUES (?1)", [SCHEMA_VERSION])?;
@@ -969,6 +1023,49 @@ mod tests {
         assert_eq!(mode, "wal");
         s2.set_outcome(id, Outcome::Kept).unwrap();
         assert_eq!(outcome_of(&s, id).0.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn landing_counts_the_latest_week_of_checks_per_app() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        for i in 0..25 {
+            s.log_fix_check(i, "Claude.exe", i % 10 != 0).unwrap();
+        }
+        s.log_fix_check(99, "notepad.exe", true).unwrap();
+        let l = s.landing("claude.exe").unwrap();
+        assert_eq!((l.checked, l.failed), (25, 3));
+        assert!(l.too_low(), "3 of 25 is more than one in fifty");
+        assert_eq!(s.landing("notepad.exe").unwrap(), Landing { checked: 1, failed: 0 });
+        assert!(!Landing { checked: 19, failed: 19 }.too_low(), "too few to tell");
+        assert!(!Landing { checked: 50, failed: 1 }.too_low());
+        s.conn.execute("UPDATE fix_checks SET ts = ts - 8 * 86400000 WHERE app_exe = 'Claude.exe'", []).unwrap();
+        assert_eq!(s.landing("claude.exe").unwrap().checked, 0, "a week later the app starts over");
+    }
+
+    #[test]
+    fn landing_keeps_only_the_newest_checks() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        for i in 0..10 {
+            s.log_fix_check(i, "a.exe", false).unwrap();
+        }
+        s.conn.execute("UPDATE fix_checks SET ts = ts - 1000", []).unwrap();
+        for i in 10..60 {
+            s.log_fix_check(i, "a.exe", true).unwrap();
+        }
+        assert_eq!(s.landing("a.exe").unwrap(), Landing { checked: 50, failed: 0 });
+    }
+
+    #[test]
+    fn an_older_build_can_open_the_file_with_the_added_tables() {
+        let dir = TempDir::new();
+        let path = dir.db();
+        Store::open(&path).unwrap().log_fix_check(1, "a.exe", true).unwrap();
+        let s = Store::open(&path).unwrap();
+        let v: i64 = s.conn.query_row("SELECT version FROM schema_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 1);
+        assert_eq!(s.landing("a.exe").unwrap().checked, 1);
     }
 
     #[test]

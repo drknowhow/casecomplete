@@ -99,6 +99,42 @@ pub fn field_text(raw: &str) -> String {
     raw.chars().map(|c| if matches!(c, '\u{FFFC}' | '\u{A0}' | '\u{202F}') { ' ' } else { c }).collect()
 }
 
+/// Whether `field`, the text before the caret read just before a fix is typed, ends with
+/// `delete`, the text the fix will remove, and has a word break before it. The last
+/// character of `delete` is the key that triggered the fix; it may not have reached the
+/// field yet, and will before the fix does, since input arrives in order.
+pub fn ready_for(field: &str, delete: &str) -> bool {
+    let fold = |c: char| match c {
+        '\u{2018}' | '\u{2019}' => '\'',
+        '\u{201C}' | '\u{201D}' => '"',
+        c if c.is_whitespace() => ' ',
+        c => c.to_lowercase().next().unwrap_or(c),
+    };
+    let field: Vec<char> = field_text(field).chars().map(fold).collect();
+    let delete: Vec<char> = delete.chars().map(fold).collect();
+    let fits = |n: usize| {
+        n <= field.len()
+            && field[field.len() - n..] == delete[..n]
+            && field[..field.len() - n].last().is_none_or(|c| !c.is_alphanumeric())
+    };
+    !delete.is_empty() && (fits(delete.len()) || (delete.len() > 1 && fits(delete.len() - 1)))
+}
+
+/// The end of `s` with letters written as `a` or `A` and digits as `0`, for the log: it
+/// shows a joined or doubled word without showing what was typed.
+pub fn shape(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    chars[chars.len().saturating_sub(TAIL)..]
+        .iter()
+        .map(|&c| match c {
+            c if c.is_uppercase() => 'A',
+            c if c.is_alphabetic() => 'a',
+            c if c.is_numeric() => '0',
+            c => c,
+        })
+        .collect()
+}
+
 /// How the end of the field's text relates to the end of the shadow buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Tail {
@@ -347,6 +383,25 @@ mod tests {
         assert_eq!(compare("something else entirely", shadow), Tail::Different);
         assert_eq!(compare("anything", ""), Tail::Same, "an empty shadow knows nothing");
         assert_eq!(compare("ab", "abc"), Tail::Different, "too short to call it lag");
+    }
+
+    #[test]
+    fn ready_for_needs_the_whole_word_before_the_caret() {
+        assert!(ready_for("I want teh ", "teh "));
+        assert!(ready_for("I want teh", "teh "), "the space may still be on its way");
+        assert!(ready_for("teh ", "teh "), "at the start of the field");
+        assert!(ready_for("(Teh\u{a0}", "teh "));
+        assert!(!ready_for("I want teh ", "tehh "), "the shadow counted a letter twice");
+        assert!(!ready_for("I want xteh ", "teh "), "part of a longer word");
+        assert!(!ready_for("I want teh t", "teh "), "a key got typed after the space");
+        assert!(!ready_for("I want te", "teh "));
+        assert!(!ready_for("anything", ""));
+    }
+
+    #[test]
+    fn shape_hides_letters_and_digits_only() {
+        assert_eq!(shape("Previous the 2nd, ok."), "Aaaaaaaa aaa 0aa, aa.");
+        assert_eq!(shape(&"x".repeat(40)).len(), TAIL);
     }
 
     #[test]
