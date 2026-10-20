@@ -236,6 +236,15 @@ fn read_endpoints_summarise_the_event_log() {
     assert_eq!(apps[0]["app_exe"], "notepad.exe");
     assert_eq!((apps[0]["fixes_kept"].as_u64(), apps[0]["fixes_reverted"].as_u64()), (Some(1), Some(1)));
     assert_eq!((apps[1]["shown"].as_u64(), apps[1]["accepted"].as_u64()), (Some(2), Some(1)));
+    assert_eq!((apps[0]["fixes_checked"].as_u64(), apps[0]["autofix_off"].as_bool()), (Some(0), Some(false)));
+    for i in 0..20 {
+        e.store.log_fix_check(i, "notepad.exe", i >= 2).unwrap();
+    }
+    let apps = e.get("/api/apps?days=7");
+    assert_eq!(
+        (apps[0]["fixes_checked"].as_u64(), apps[0]["fixes_misplaced"].as_u64(), apps[0]["autofix_off"].as_bool()),
+        (Some(20), Some(2), Some(true))
+    );
 
     let conf = e.get("/api/confidence?days=7");
     let conf = conf.as_array().unwrap();

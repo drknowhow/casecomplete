@@ -252,21 +252,24 @@ fn latency(ctx: &Ctx, req: &Req) -> Res {
 
 fn apps(ctx: &Ctx, req: &Req) -> Res {
     let days = days_param(req, 30)?;
-    let rows = open(ctx)?.by_app(Some(since_days(days)))?;
-    Ok(Value::Array(
-        rows.into_iter()
-            .take(MAX_APPS)
-            .map(|a| {
-                json!({
-                    "app_exe": a.app_exe,
-                    "fixes_kept": a.fixes_kept,
-                    "fixes_reverted": a.fixes_reverted,
-                    "shown": a.shown,
-                    "accepted": a.accepted,
-                })
-            })
-            .collect(),
-    ))
+    let store = open(ctx)?;
+    let rows = store.by_app(Some(since_days(days)))?;
+    let mut out = Vec::new();
+    for a in rows.into_iter().take(MAX_APPS) {
+        // How the app's latest fixes read back; independent of the period shown.
+        let landing = store.landing(&a.app_exe)?;
+        out.push(json!({
+            "app_exe": a.app_exe,
+            "fixes_kept": a.fixes_kept,
+            "fixes_reverted": a.fixes_reverted,
+            "shown": a.shown,
+            "accepted": a.accepted,
+            "fixes_checked": landing.checked,
+            "fixes_misplaced": landing.failed,
+            "autofix_off": landing.too_low(),
+        }));
+    }
+    Ok(Value::Array(out))
 }
 
 fn confidence(ctx: &Ctx, req: &Req) -> Res {

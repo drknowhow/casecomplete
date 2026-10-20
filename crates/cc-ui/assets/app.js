@@ -271,7 +271,9 @@
         <span class="track"><i class="${warn ? 'warn' : ''}" style="width:${Math.max(2, (val / max) * 100).toFixed(1)}%"></i></span>
         <span class="count ${warn ? 'warn' : ''}">${fmt(val)}</span>`;
     }).join('');
-    return `<div class="apps">${cells}</div>${anyWarn ? '<span class="note">Orange: an app where fixes get undone more than 25% of the time.</span>' : ''}`;
+    const off = (apps || []).filter((a) => a.autofix_off).map((a) =>
+      `<span class="note">Auto-fix is off in ${esc(appName(a.app_exe))}: ${fmt(a.fixes_misplaced)} of its last ${fmt(a.fixes_checked)} fixes did not land as typed. It comes back a week after those misses.</span>`).join('');
+    return `<div class="apps">${cells}</div>${anyWarn ? '<span class="note">Orange: an app where fixes get undone more than 25% of the time.</span>' : ''}${off}`;
   }
 
   function confidenceChart(rows, floor) {
