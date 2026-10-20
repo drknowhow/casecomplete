@@ -195,6 +195,8 @@ struct App {
     paused_until: Option<Instant>,
     /// Rules the nightly tuning demoted to suggest-only.
     demoted: HashSet<String>,
+    /// `(typed, fix)` pairs, lowercase, the user undid (`Store::undone_pairs`); never typed again.
+    undone: HashSet<(String, String)>,
     /// For the language model's second opinion on a fix; completions go through `engine`.
     client: CompletionClient,
     /// (event id, applied at, shadow length right after) of the last auto fix awaiting an outcome.
@@ -741,6 +743,11 @@ impl App {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
         };
+        if self.undone.contains(&(c.original.to_lowercase(), c.replacement.to_lowercase())) {
+            log::info!("fix {:?} -> {:?} [{}] not applied: undone before", c.original, c.replacement, c.rule);
+            self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+            return;
+        }
         // The fix deletes `original` back from the caret. Unless the shadow saw what precedes
         // it, that may be the tail of a longer word, and the result would be a mangled word.
         let whole_word = body_len > c.original.len() || self.shadow.anchored();
@@ -1075,6 +1082,7 @@ impl App {
         self.pending_fix_event = None;
         self.outcome(fix.event_id, Outcome::Reverted);
         self.note_undo();
+        self.undone.insert((fix.original.to_lowercase(), fix.replacement.to_lowercase()));
         self.dont_touch.insert(fix.original.clone());
         self.auto.remove(&fix.original);
         if let Err(e) = self.auto.save(&self.auto_path) {
@@ -1676,6 +1684,9 @@ fn start() -> anyhow::Result<()> {
     let ui = UiServer::start(&profile.join("events.db"), &profile, ui_state.clone(), ui_tx).context("ui server")?;
     let windows = Windows::new().context("ui windows")?;
     log::info!("dashboard: {}", ui.url("dashboard"));
+    // Demotions and undone pairs from earlier sessions; tuning only reports new demotions.
+    let demoted: HashSet<String> = store.demoted_rules().unwrap_or_default().into_iter().collect();
+    let undone: HashSet<(String, String)> = store.undone_pairs().unwrap_or_default().into_iter().collect();
     let auto = AutocorrectList::load(&auto_path);
     if auto.file_is_stale() {
         if let Err(e) = auto.save(&auto_path) {
@@ -1700,7 +1711,8 @@ fn start() -> anyhow::Result<()> {
         last_prompt_tail: String::new(),
         enabled: settings.enabled,
         paused_until: None,
-        demoted: HashSet::new(),
+        demoted,
+        undone,
         client,
         pending_fix_event: None,
         pending_completion_event: None,

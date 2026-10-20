@@ -33,6 +33,8 @@ const MAX_CONTEXT_CHARS: usize = 200;
 const DEMOTE_MIN_AUTO: u64 = 20;
 /// Minimum suggestions before a promotion can be offered.
 const PROMOTE_MIN_SUGGESTED: u64 = 50;
+/// An auto-fix backspaced over this soon after it went in counts as undone, like a revert.
+const QUICK_OVERWRITE_MS: i64 = 3000;
 /// How many of an app's latest fix checks [`Store::landing`] counts.
 const LANDING_WINDOW: u32 = 50;
 /// Checks an app needs before [`Landing::too_low`] can say it does not take fixes cleanly.
@@ -187,6 +189,7 @@ pub struct Metrics {
 pub struct RuleStat {
     pub rule: String,
     pub auto_total: u64,
+    /// Undone: reverted, or backspaced over within 3 s.
     pub auto_reverted: u64,
     pub suggested_total: u64,
     pub suggested_accepted: u64,
@@ -426,13 +429,14 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT rule, \
                COUNT(CASE WHEN action = 'auto' THEN 1 END), \
-               COUNT(CASE WHEN action = 'auto' AND outcome = 'reverted' THEN 1 END), \
+               COUNT(CASE WHEN action = 'auto' AND (outcome = 'reverted' \
+                 OR (outcome = 'overwritten' AND outcome_ts - ts <= ?2)) THEN 1 END), \
                COUNT(CASE WHEN action = 'suggested' THEN 1 END), \
                COUNT(CASE WHEN action = 'suggested' AND outcome = 'accepted' THEN 1 END) \
              FROM events GROUP BY rule HAVING COUNT(*) >= ?1 \
              ORDER BY COUNT(*) DESC, rule",
         )?;
-        let rows = stmt.query_map([min], |r| {
+        let rows = stmt.query_map(params![min, QUICK_OVERWRITE_MS], |r| {
             Ok(RuleStat {
                 rule: r.get(0)?,
                 auto_total: cnt(r.get(1)?),
@@ -472,7 +476,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "SELECT e.rule, \
                    COUNT(CASE WHEN e.action = 'auto' THEN 1 END), \
-                   COUNT(CASE WHEN e.action = 'auto' AND e.outcome = 'reverted' THEN 1 END), \
+                   COUNT(CASE WHEN e.action = 'auto' AND (e.outcome = 'reverted' \
+                     OR (e.outcome = 'overwritten' AND e.outcome_ts - e.ts <= ?1)) THEN 1 END), \
                    COUNT(CASE WHEN e.action = 'suggested' THEN 1 END), \
                    COUNT(CASE WHEN e.action = 'suggested' AND e.outcome = 'accepted' THEN 1 END), \
                    COALESCE(MAX(o.max_severity = 'suggest'), 0) \
@@ -480,7 +485,7 @@ impl Store {
                  WHERE o.rule IS NULL OR o.max_severity <> 'auto' OR e.ts > o.since \
                  GROUP BY e.rule ORDER BY e.rule",
             )?;
-            let it = stmt.query_map([], |r| {
+            let it = stmt.query_map([QUICK_OVERWRITE_MS], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     cnt(r.get(1)?),
@@ -506,7 +511,7 @@ impl Store {
                 .execute(params![rule, now])?;
                 out.push(Tuning::Demote {
                     reason: format!(
-                        "{auto_reverted} of {auto_total} auto-fixes reverted ({}%)",
+                        "{auto_reverted} of {auto_total} auto-fixes undone ({}%)",
                         pct(auto_reverted, auto_total)
                     ),
                     rule: rule.clone(),
@@ -760,6 +765,22 @@ impl Store {
                 latency_ms: u32::try_from(r.get::<_, i64>(12)?.max(0)).unwrap_or(u32::MAX),
             })
         })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// `(typed, fix)` pairs, lowercase, of auto-fixes the user rejects: undone (reverted, or
+    /// backspaced over within 3 s) and never kept, or undone three times and at least as
+    /// often as kept.
+    pub fn undone_pairs(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT lower(original), lower(replacement), \
+               COUNT(CASE WHEN outcome = 'reverted' \
+                 OR (outcome = 'overwritten' AND outcome_ts - ts <= ?1) THEN 1 END) AS undone, \
+               COUNT(CASE WHEN outcome = 'kept' THEN 1 END) AS kept \
+             FROM events WHERE action = 'auto' AND source <> 'llm_complete' \
+             GROUP BY 1, 2 HAVING (undone >= 1 AND kept = 0) OR (undone >= 3 AND undone >= kept)",
+        )?;
+        let rows = stmt.query_map([QUICK_OVERWRITE_MS], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1023,6 +1044,39 @@ mod tests {
         assert_eq!(mode, "wal");
         s2.set_outcome(id, Outcome::Kept).unwrap();
         assert_eq!(outcome_of(&s, id).0.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn undone_pairs_are_fixes_the_user_rejects() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        let auto = |typed: &str, fixed: &str, outcome: Outcome| {
+            let id = s.log(&fix("spell", Action::Auto, typed, fixed)).unwrap();
+            s.set_outcome(id, outcome).unwrap();
+            id
+        };
+        auto("ok", "k", Outcome::Overwritten);
+        auto("thhe", "the", Outcome::Kept);
+        auto("thhe", "the", Outcome::Overwritten);
+        auto("Tst", "test", Outcome::Reverted);
+        let late = auto("ender", "under", Outcome::Overwritten);
+        s.conn.execute("UPDATE events SET outcome_ts = ts + 9000 WHERE id = ?1", [late]).unwrap();
+        let mut pairs = s.undone_pairs().unwrap();
+        pairs.sort();
+        assert_eq!(pairs, [("ok".to_string(), "k".to_string()), ("tst".to_string(), "test".to_string())]);
+    }
+
+    #[test]
+    fn tune_counts_a_quick_overwrite_as_undone() {
+        let dir = TempDir::new();
+        let s = Store::open(&dir.db()).unwrap();
+        for i in 0..20 {
+            let id = s.log(&fix("r", Action::Auto, "teh", "the")).unwrap();
+            s.set_outcome(id, if i < 6 { Outcome::Overwritten } else { Outcome::Kept }).unwrap();
+        }
+        let t = s.tune().unwrap();
+        assert!(matches!(&t[..], [Tuning::Demote { rule, reason }] if rule == "r" && reason.contains("6 of 20")), "{t:?}");
+        assert_eq!(s.rule_stats(0).unwrap()[0].auto_reverted, 6);
     }
 
     #[test]
