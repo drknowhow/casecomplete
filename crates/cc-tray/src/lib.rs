@@ -89,7 +89,7 @@ const LEVELS: [(&str, &str, &str); 4] = [
     ("cc-tray.level.off", "off", "Off"),
     ("cc-tray.level.s0", "S0", "Typos (S0)"),
     ("cc-tray.level.s1", "S1", "Typos + grammar (S1)"),
-    ("cc-tray.level.s2", "S2", "Also ambiguous (S2)"),
+    ("cc-tray.level.s2", "S2", "Also capitalised words (S2)"),
 ];
 
 /// Models: (menu id, value reported in events, menu label).
