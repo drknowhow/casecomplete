@@ -31,13 +31,26 @@ pub struct CompletionClient {
 
 impl CompletionClient {
     pub fn new(base_url: &str) -> CompletionClient {
+        Self::build(base_url, true)
+    }
+
+    /// A client that opens a new connection for each request, for a caller whose runtime
+    /// runs only during its own requests. Nothing polls an idle pooled connection between
+    /// them, so one the server has closed would fail the next request (os error 10053).
+    pub fn unpooled(base_url: &str) -> CompletionClient {
+        Self::build(base_url, false)
+    }
+
+    fn build(base_url: &str, pool: bool) -> CompletionClient {
         // llama-server is on loopback; never route it through the system proxy.
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
-            .tcp_nodelay(true)
-            .build()
-            .expect("building reqwest client");
+            .tcp_nodelay(true);
+        if !pool {
+            builder = builder.pool_max_idle_per_host(0);
+        }
+        let http = builder.build().expect("building reqwest client");
         CompletionClient { http, base_url: base_url.trim_end_matches('/').to_string() }
     }
 
