@@ -7,12 +7,13 @@
 //! ```
 //!
 //! Ctrl+Alt+Z is always swallowed and reported as `RevertRequested`. Key-ups and injected
-//! input are never reported. Focus any other window and type; events appear here.
+//! input are never reported. Focus any other window and type; events appear here, each
+//! with the number of keys and clicks that had reached the app.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cc_hook::{now_ms, start, HookEvent, SwallowState};
+use cc_hook::{now_ms, start, Stamped, SwallowState};
 use crossbeam_channel::RecvTimeoutError;
 
 const RUN_FOR: Duration = Duration::from_secs(20);
@@ -22,7 +23,7 @@ fn main() -> anyhow::Result<()> {
     let ghost = args.iter().any(|a| a == "--ghost");
     let revert = args.iter().any(|a| a == "--revert");
 
-    let (tx, rx) = crossbeam_channel::bounded::<HookEvent>(1024);
+    let (tx, rx) = crossbeam_channel::bounded::<Stamped>(1024);
     let swallow = Arc::new(SwallowState::default());
     swallow.set_ghost_visible(ghost);
     if revert {
@@ -43,7 +44,7 @@ fn main() -> anyhow::Result<()> {
             break;
         }
         match rx.recv_timeout(deadline - now) {
-            Ok(ev) => println!("[{:>6} ms] {:?}", now_ms(), ev),
+            Ok((seq, ev)) => println!("[{:>6} ms] #{seq} {:?}", now_ms(), ev),
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => break,
         }
