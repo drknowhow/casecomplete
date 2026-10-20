@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 (2026-10-20)
+
+- Auto-fix no longer joins or splits words. An edit across two words (`out side`, `every one`, `had had`) is never applied automatically, and a fix replaces one word with one word unless it comes from your autocorrect list
+- A fix starts only when no key you typed is still on its way to the app and, in apps that expose their text, only after reading that the field ends with the word it replaces
+- Spelling is auto-fixed only for doubled keys (`thhe`, `soo`) or a single slip that keeps the first letter in a word of four letters or more (`documnet`). Less certain guesses such as `calory` or `morth` are left as you typed them, and so are abbreviations and coined words (`xlsx`, `htmlr`)
+- A guessed fix, one that is not doubled keys or on your autocorrect list, first asks the language model, and is skipped when the model expects another word or gives no answer within 300 ms
+- Auto-fix works only where completions do: editable fields that are not passwords, in apps the privacy settings allow. It used to type into read-only pages, password fields and apps turned off in privacy settings, and could learn typos there
+- The Bold level adds only doubled letters in capitalised words (`Outllook`); its other guesses were kept about a third of the time
+- A fix you undid and never kept is not typed again, overwriting a fix within 3 s counts as undoing it, and rules demoted for too many undos stay demoted after a restart
+- When more than 1 in 50 of an app's recent fixes land wrong, auto-fix turns off in that app and the dashboard says so
+- Autocorrect entries are learned without the punctuation around the typo
+
 ## 0.1.2 (2026-10-15)
 
 - Contractions survive: the apostrophe no longer ends a word, so `doesn't` is not cut down to `does't`
