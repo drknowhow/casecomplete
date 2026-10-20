@@ -48,6 +48,11 @@ const UNDERLINE_FADE_MS: u32 = 1500;
 /// Electron apps can take a while to update what UIA sees.
 const FIX_CHECK_RETRIES: u8 = 2;
 const FIX_RECHECK_AFTER: Duration = Duration::from_millis(200);
+/// How long a fix waits for the language model's view of the word; past it, the fix goes
+/// in on the typing model alone.
+const MODEL_CHECK_TIMEOUT: Duration = Duration::from_millis(150);
+/// Next-token candidates asked for in that check.
+const MODEL_CHECK_TOKENS: u32 = 40;
 const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
 /// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
 /// is the only context and editability is assumed.
@@ -190,6 +195,8 @@ struct App {
     paused_until: Option<Instant>,
     /// Rules the nightly tuning demoted to suggest-only.
     demoted: HashSet<String>,
+    /// For the language model's second opinion on a fix; completions go through `engine`.
+    client: CompletionClient,
     /// (event id, applied at, shadow length right after) of the last auto fix awaiting an outcome.
     pending_fix_event: Option<(i64, Instant, usize)>,
     pending_completion_event: Option<i64>,
@@ -555,11 +562,50 @@ impl App {
         self.logprob_sum = 0.0;
         // Recently accepted sentences in this app give the base model your voice.
         self.last_prompt_tail = ctx.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
-        let ctx = if self.style_lines.is_empty() { ctx } else { format!("{}\n\n{}", self.style_lines.join("\n"), ctx) };
+        let ctx = self.prompt_for(ctx);
         self.gen += 1;
         self.req_started = Some(Instant::now());
         self.first_token_logged = false;
         let _ = self.engine.send(Req { gen: self.gen, prompt: ctx, cancel: self.cancel.clone() });
+    }
+
+    /// The model prompt for `ctx`: recently accepted sentences in this app give the base
+    /// model your voice. The model's second opinion on a fix uses the same prompt, so it
+    /// mostly reuses the completion's cached prefix.
+    fn prompt_for(&self, ctx: String) -> String {
+        if self.style_lines.is_empty() {
+            ctx
+        } else {
+            format!("{}\n\n{}", self.style_lines.join("\n"), ctx)
+        }
+    }
+
+    /// A dictionary word close to `typo` that the model clearly expects after `before` (the
+    /// text up to the typo) instead of `fix` (`fixgate::model_prefers`). None when the
+    /// engine is not running or does not answer in time.
+    fn model_prefers_other(&self, before: &str, typo: &str, fix: &str) -> Option<String> {
+        self.sidecar.as_ref()?;
+        let ctx = before.trim_end_matches(' ');
+        if ctx.trim().is_empty() {
+            return None;
+        }
+        let prompt = self.prompt_for(ctx.to_string());
+        let client = self.client.clone();
+        let asked = self.rt.block_on(async move {
+            tokio::time::timeout(MODEL_CHECK_TIMEOUT, client.next_tokens(&prompt, MODEL_CHECK_TOKENS)).await
+        });
+        let top = match asked {
+            Ok(Ok(top)) => top,
+            Ok(Err(e)) => {
+                log::debug!("model check failed: {e:#}");
+                return None;
+            }
+            Err(_) => {
+                log::debug!("model check took over {} ms", MODEL_CHECK_TIMEOUT.as_millis());
+                return None;
+            }
+        };
+        fixgate::model_prefers(typo, fix, &top, |w| self.checker.is_word(w, &self.dict))
     }
 
     fn show_ghost(&mut self) {
@@ -713,6 +759,22 @@ impl App {
         );
         self.prev_boundary = None;
         self.cancel_ghost();
+        // A typing-model pick other than a doubled letter gets the language model's view of
+        // the word, with keys captured meanwhile so the field stays put.
+        if c.rule == "spell" && c.severity == Severity::S0 && !cc_correct::is_doubled_letter_typo(&c.original, &c.replacement) {
+            if !self.swallow.begin_capture(self.applied) {
+                log::info!("fix not applied: typed ahead of it");
+                return;
+            }
+            let text = self.shadow.text();
+            let before = text[..text.len() - boundary.len_utf8() - c.original.len()].to_string();
+            if let Some(expected) = self.model_prefers_other(&before, &c.original, &c.replacement) {
+                log::info!("fix {:?} -> {:?} not applied: the model expects {:?}", c.original, c.replacement, expected);
+                self.end_capture();
+                self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+                return;
+            }
+        }
         let caret = cc_context::caret_rect();
         let mut typed = c.replacement.clone();
         typed.push(boundary);
@@ -1559,8 +1621,10 @@ fn start() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
     let (tx, rx) = unbounded::<Msg>();
+    let engine = spawn_engine(CompletionClient::new(&sidecar_url()), tx.clone());
+    // Its own client: a pooled connection is driven by the runtime that opened it, and this
+    // one runs only while the orchestrator waits on a model check.
     let client = CompletionClient::new(&sidecar_url());
-    let engine = spawn_engine(client, tx.clone());
 
     let overlay = Overlay::new().context("overlay")?;
     let swallow = Arc::new(SwallowState::default());
@@ -1637,6 +1701,7 @@ fn start() -> anyhow::Result<()> {
         enabled: settings.enabled,
         paused_until: None,
         demoted: HashSet::new(),
+        client,
         pending_fix_event: None,
         pending_completion_event: None,
         completion_latency_ms: 0,

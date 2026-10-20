@@ -124,6 +124,49 @@ impl CompletionClient {
         // the generation for that slot and keeps the prompt in its KV cache.
         Ok(acc.finish())
     }
+
+    /// The `n` likeliest tokens to follow `prompt`, as (token text, log probability),
+    /// likeliest first. One short request that generates a single token.
+    pub async fn next_tokens(&self, prompt: &str, n: u32) -> anyhow::Result<Vec<(String, f32)>> {
+        let url = format!("{}/completion", self.base_url);
+        let body = json!({
+            "prompt": prompt,
+            "n_predict": 1,
+            "temperature": 0,
+            "stream": false,
+            "cache_prompt": true,
+            "n_probs": n,
+        });
+        let resp = self.http.post(&url).json(&body).send().await.with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("llama-server returned HTTP {status}");
+        }
+        let v: Value = resp.json().await.context("reading next-token probabilities")?;
+        Ok(top_tokens(&v))
+    }
+}
+
+/// The candidates for the first generated token in a non-streaming `/completion` reply, in
+/// any of the shapes `entry_logprob` knows.
+fn top_tokens(reply: &Value) -> Vec<(String, f32)> {
+    let Some(first) = reply.pointer("/completion_probabilities/0") else { return Vec::new() };
+    for key in ["top_logprobs", "top_probs", "probs"] {
+        let Some(list) = first.get(key).and_then(Value::as_array) else { continue };
+        return list
+            .iter()
+            .filter_map(|c| {
+                let token = c.get("token").or_else(|| c.get("tok_str")).and_then(Value::as_str)?;
+                let lp = c
+                    .get("logprob")
+                    .and_then(Value::as_f64)
+                    .filter(|x| x.is_finite())
+                    .or_else(|| c.get("prob").and_then(Value::as_f64).and_then(prob_to_logprob))?;
+                Some((token.to_string(), lp as f32))
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 fn request_body(prompt: &str, n_predict: u32) -> Value {
@@ -420,6 +463,28 @@ mod tests {
         assert!(e.logprobs.is_empty());
         let e = ev(r#"data: {"content":"x","stop":false,"completion_probabilities":[{"token":"x"}]}"#);
         assert!(e.logprobs.is_empty());
+    }
+
+    #[test]
+    fn top_tokens_reads_every_reply_shape() {
+        let current: Value = serde_json::from_str(
+            r#"{"content":" month","completion_probabilities":[{"token":" month","logprob":-0.5,
+                "top_logprobs":[{"id":1,"token":" month","logprob":-0.5},{"id":2,"token":" week","logprob":-1.5}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(top_tokens(&current), vec![(" month".to_string(), -0.5), (" week".to_string(), -1.5)]);
+        let post: Value = serde_json::from_str(
+            r#"{"completion_probabilities":[{"token":" a","prob":0.5,"top_probs":[{"token":" a","prob":0.5},{"token":" b","prob":0.0}]}]}"#,
+        )
+        .unwrap();
+        let t = top_tokens(&post);
+        assert_eq!(t.len(), 1, "a zero probability has no logprob: {t:?}");
+        assert!((t[0].1 - 0.5f32.ln()).abs() < 1e-6);
+        let old: Value =
+            serde_json::from_str(r#"{"completion_probabilities":[{"content":" x","probs":[{"tok_str":" x","prob":1.0}]}]}"#)
+                .unwrap();
+        assert_eq!(top_tokens(&old), vec![(" x".to_string(), 0.0)]);
+        assert!(top_tokens(&json!({"content": ""})).is_empty());
     }
 
     #[test]

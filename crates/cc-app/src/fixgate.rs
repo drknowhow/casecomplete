@@ -120,6 +120,35 @@ pub fn ready_for(field: &str, delete: &str) -> bool {
     !delete.is_empty() && (fits(delete.len()) || (delete.len() > 1 && fits(delete.len() - 1)))
 }
 
+/// The dictionary word close to `typo` that the language model clearly prefers over `fix`,
+/// given the model's likeliest next tokens (`top`) after the text before the typo: its
+/// token is at least four times as likely as any token `fix` starts with. `this morth`
+/// gives `month`, where the typing model alone picks `north`.
+pub fn model_prefers(typo: &str, fix: &str, top: &[(String, f32)], is_word: impl Fn(&str) -> bool) -> Option<String> {
+    let typo = typo.to_lowercase();
+    let fix = fix.to_lowercase();
+    let reach = (typo.chars().count() / 3).max(2);
+    let mut fix_lp = f32::NEG_INFINITY;
+    let mut other: Option<(String, f32)> = None;
+    for (token, lp) in top {
+        let word = token.trim().to_lowercase();
+        if word.is_empty() || !word.chars().all(char::is_alphabetic) {
+            continue;
+        }
+        if fix.starts_with(&word) && (word.chars().count() >= 2 || word == fix) {
+            fix_lp = fix_lp.max(*lp);
+        } else if word.chars().count() >= 2
+            && cc_correct::edit_distance(&typo, &word) <= reach
+            && is_word(&word)
+            && other.as_ref().is_none_or(|(_, best)| lp > best)
+        {
+            other = Some((word, *lp));
+        }
+    }
+    let (word, lp) = other?;
+    (lp - fix_lp >= 4f32.ln()).then_some(word)
+}
+
 /// The end of `s` with letters written as `a` or `A` and digits as `0`, for the log: it
 /// shows a joined or doubled word without showing what was typed.
 pub fn shape(s: &str) -> String {
@@ -396,6 +425,28 @@ mod tests {
         assert!(!ready_for("I want teh t", "teh "), "a key got typed after the space");
         assert!(!ready_for("I want te", "teh "));
         assert!(!ready_for("anything", ""));
+    }
+
+    #[test]
+    fn model_prefers_a_close_word_it_rates_far_higher() {
+        let top = |pairs: &[(&str, f32)]| pairs.iter().map(|(t, lp)| (t.to_string(), *lp)).collect::<Vec<_>>();
+        let words = |w: &str| ["month", "north", "week", "the", "ten", "calorie", "cal"].contains(&w);
+        assert_eq!(
+            model_prefers("morth", "north", &top(&[(" month", -0.7), (" week", -1.9)]), words).as_deref(),
+            Some("month")
+        );
+        assert_eq!(model_prefers("teh", "the", &top(&[(" the", -0.2), (" ten", -3.0)]), words), None);
+        assert_eq!(
+            model_prefers("calory", "calorie", &top(&[(" cal", -0.5), (" month", -0.4)]), words),
+            None,
+            "a token the fix starts with counts for the fix, and month is too far from the typo"
+        );
+        assert_eq!(model_prefers("morth", "north", &top(&[(" mxrth", -0.1)]), words), None, "not a word");
+        assert_eq!(
+            model_prefers("morth", "north", &top(&[(" north", -1.0), (" month", -0.5)]), words),
+            None,
+            "not four times as likely"
+        );
     }
 
     #[test]
