@@ -6,7 +6,9 @@
 //! * `S0`: a typo with one obvious fix (auto-apply).
 //! * `S1`: grammar / punctuation / capitalisation with one clear fix (auto-apply).
 //! * `S2`: ambiguous (several fixes, or a distant spelling match). Suggest only.
-//! * `S3`: never returned here. Lints without a replacement are dropped.
+//! * `S3`: style rewrites, and edits across several words (`Every one` -> `Everyone`,
+//!   `had had` -> `had`), which are right or wrong depending on words not typed yet.
+//!   Never auto-applied. Lints without a replacement are dropped.
 //!
 //! Harper's `SpellCheck` always offers up to three suggestions, ordered by an edit-distance
 //! heuristic that is blind to typing mistakes (`hoow` -> `hood`, `easty` -> `east`,
@@ -33,6 +35,24 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     osa_distance(&a, &b)
+}
+
+/// Whether `typed` is `fix` with one or more letters pressed twice in a row (`thhe` for
+/// `the`, `Outllook` for `Outlook`). Case is ignored.
+pub fn is_doubled_letter_typo(typed: &str, fix: &str) -> bool {
+    let typed: Vec<char> = typed.chars().map(lc).collect();
+    let fix: Vec<char> = fix.chars().map(lc).collect();
+    let (mut j, mut extra) = (0, 0);
+    for (i, &c) in typed.iter().enumerate() {
+        if j < fix.len() && c == fix[j] {
+            j += 1;
+        } else if i > 0 && c == typed[i - 1] && c.is_alphabetic() {
+            extra += 1;
+        } else {
+            return false;
+        }
+    }
+    j == fix.len() && extra > 0
 }
 
 /// How sure the checker is that a change is safe to apply. Lower is more automatic.
@@ -237,7 +257,7 @@ impl Checker {
             let rule = rule_id(&key);
             for lint in lints {
                 match self.map_lint(&key, &rule, &lint, &source, dictionary) {
-                    Ok(pair) => mapped.push(pair),
+                    Ok(entry) => mapped.push(entry),
                     Err(dropped) => out.dropped.push(dropped),
                 }
             }
@@ -247,7 +267,8 @@ impl Checker {
         out
     }
 
-    /// Map one Harper lint. `Ok((candidate, is_spelling))` or `Err(dropped)`.
+    /// Map one Harper lint. `Ok((candidate, is_spelling, never_auto))` or `Err(dropped)`;
+    /// a `never_auto` candidate becomes S3 once it has won its span (see `resolve_overlaps`).
     fn map_lint(
         &self,
         key: &str,
@@ -255,7 +276,7 @@ impl Checker {
         lint: &Lint,
         source: &[char],
         dictionary: &PersonalDictionary,
-    ) -> Result<(Candidate, bool), Dropped> {
+    ) -> Result<(Candidate, bool, bool), Dropped> {
         let (start, end) = (lint.span.start, lint.span.end);
         let original: String = if start < end && end <= source.len() {
             source[start..end].iter().collect()
@@ -300,9 +321,10 @@ impl Checker {
         }
 
         let is_spelling = key == "SpellCheck" || lint.lint_kind == LintKind::Spelling;
+        let style = !is_spelling && style_like(&lint.lint_kind);
         let (replacement, mut severity, mut confidence) = if is_spelling {
             self.classify_spelling(&original, &texts)
-        } else if texts.len() == 1 && !style_like(&lint.lint_kind) && key != "SplitWords" {
+        } else if texts.len() == 1 && !style && key != "SplitWords" {
             (texts[0].clone(), Severity::S1, 0.9)
         } else {
             (texts[0].clone(), Severity::S2, 0.5)
@@ -319,6 +341,18 @@ impl Checker {
         if replacement == original {
             return Err(drop("replacement_equals_original"));
         }
+        // Whether an edit across several words is right depends on the words after it:
+        // `Every one of them` and `had had` are correct English. One that changes a single
+        // word of the span is narrowed to that word (`to loose` -> `to lose` is `loose`).
+        let (start, end, original, replacement, across_words) = if original.split_whitespace().count() < 2 {
+            (start, end, original, replacement, false)
+        } else if let Some((offset, from, to)) = changed_word(&original, &replacement) {
+            let start = start + offset;
+            (start, start + from.chars().count(), from, to, false)
+        } else {
+            (start, end, original, replacement, true)
+        };
+        let never_auto = style || across_words;
         // Capitalisation rules find a name or acronym in Harper's dictionary that matches a
         // lowercase typo of a common word: `fromm` -> `Fromm`, `orr` -> `Orr`, `ne` -> `NE`.
         if severity == Severity::S1
@@ -327,7 +361,11 @@ impl Checker {
         {
             if let Some((fix, confidence)) = common_word_typo(&original) {
                 let rule = "spell".to_string();
-                return Ok((Candidate { start, end, original, replacement: fix, rule, severity: Severity::S0, confidence }, true));
+                return Ok((
+                    Candidate { start, end, original, replacement: fix, rule, severity: Severity::S0, confidence },
+                    true,
+                    never_auto,
+                ));
             }
             if near_common_word(&original) || is_shouty(&replacement) {
                 severity = Severity::S2;
@@ -345,6 +383,7 @@ impl Checker {
                 confidence,
             },
             is_spelling,
+            never_auto,
         ))
     }
 
@@ -438,9 +477,13 @@ impl Checker {
         // unknown word is probably a name: only a very common word may replace it automatically.
         let dialect_variant = self.dict.contains_word(&orig);
         let name_risk = first_upper && !common_words().contains(best.text.as_str());
+        let long_enough = orig.len() >= MIN_S0_LEN
+            || (orig.len() >= 3
+                && is_doubled_letter_typo(original, &best.text)
+                && common_words().contains(best.text.as_str()));
         if !dialect_variant
             && !name_risk
-            && orig.len() >= MIN_S0_LEN
+            && long_enough
             && margin >= S0_MIN_MARGIN
             && confidence >= S0_MIN_CONFIDENCE
         {
@@ -461,8 +504,9 @@ const POOL_SIZE: usize = 200;
 const CACHE_LIMIT: usize = 4096;
 /// S0 needs a Damerau-Levenshtein distance of at most this.
 const S0_MAX_DISTANCE: usize = 2;
-/// S0 needs an original of at least this many chars.
-const MIN_S0_LEN: usize = 3;
+/// S0 needs an original of at least this many chars, unless it is a common word with a
+/// doubled letter (`soo`). Shorter typos have several likely fixes: `har` is `her` or `has`.
+const MIN_S0_LEN: usize = 4;
 /// S0 needs `1 - distance / len` of at least this. (Not in the brief; keeps 2 edits on a
 /// 4-letter word from being auto-applied.)
 const S0_MIN_CONFIDENCE: f32 = 0.6;
@@ -675,12 +719,15 @@ fn near_common_word(word: &str) -> bool {
 /// one, with the confidence an S0 fix gets.
 fn common_word_typo(word: &str) -> Option<(String, f32)> {
     let len = word.chars().count();
-    if len < MIN_S0_LEN || common_words().contains(word) {
+    if len < 3 || common_words().contains(word) {
         return None;
     }
     let mut scored = common_neighbours(word);
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
     let best = scored.first()?;
+    if len < MIN_S0_LEN && !is_doubled_letter_typo(word, best.1) {
+        return None;
+    }
     let margin = scored.get(1).map_or(f32::INFINITY, |second| second.0 - best.0);
     let confidence = 1.0 - 1.0 / len as f32;
     (margin >= S0_MIN_MARGIN && confidence >= S0_MIN_CONFIDENCE).then(|| (best.1.to_string(), confidence))
@@ -728,8 +775,37 @@ fn plausible_split(text: &str) -> bool {
         .all(|part| part.chars().count() >= 2 || matches!(part, "a" | "A" | "I" | "i"))
 }
 
-/// Lint kinds that are about style, not correctness. Even with one suggestion they are
-/// "suggest" (S2), never auto-apply: the architecture doc puts style rewrites in S3.
+/// Words of `s` with their char offsets.
+fn word_spans(s: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut at_word_start = true;
+    for (i, c) in s.chars().enumerate() {
+        if c.is_whitespace() {
+            at_word_start = true;
+        } else if at_word_start {
+            out.push((i, c.to_string()));
+            at_word_start = false;
+        } else if let Some(last) = out.last_mut() {
+            last.1.push(c);
+        }
+    }
+    out
+}
+
+/// The only word `replacement` changes in `original`: its char offset in `original`, the
+/// word, and what it becomes. None when the number of words differs or several change.
+fn changed_word(original: &str, replacement: &str) -> Option<(usize, String, String)> {
+    let (from, to) = (word_spans(original), word_spans(replacement));
+    if from.len() != to.len() {
+        return None;
+    }
+    let mut changed = from.into_iter().zip(to).filter(|(a, b)| a.1 != b.1);
+    let ((offset, word), (_, new)) = changed.next()?;
+    changed.next().is_none().then_some((offset, word, new))
+}
+
+/// Lint kinds that are about style, not correctness. They are S3 even with one suggestion:
+/// the architecture doc puts style rewrites there.
 fn style_like(kind: &LintKind) -> bool {
     matches!(
         kind,
@@ -822,15 +898,17 @@ fn overlaps(a: &Candidate, b: &Candidate) -> bool {
 /// capitalisation or a word-split guess) wins, because it knows things the spell checker does
 /// not (`alot` -> `a lot`, not `alto`). Otherwise the lowest severity wins, then spelling over
 /// other rules, then higher confidence. Losers are reported as dropped.
-/// Input is `(candidate, is_spelling)`.
-fn resolve_overlaps(mut mapped: Vec<(Candidate, bool)>, dropped: &mut Vec<Dropped>) -> Vec<Candidate> {
+/// Input is `(candidate, is_spelling, never_auto)`. A `never_auto` winner becomes S3 only
+/// after the spans are settled, so it still keeps its span from other rules: `that that`
+/// would otherwise go to the S1 `that` -> `which`.
+fn resolve_overlaps(mut mapped: Vec<(Candidate, bool, bool)>, dropped: &mut Vec<Dropped>) -> Vec<Candidate> {
     let specific = |c: &Candidate, is_spelling: bool| {
         !is_spelling
             && c.severity == Severity::S1
             && c.rule != "split_words"
             && !c.rule.contains("capitalization")
     };
-    mapped.sort_by(|(a, a_spell), (b, b_spell)| {
+    mapped.sort_by(|(a, a_spell, _), (b, b_spell, _)| {
         specific(b, *b_spell)
             .cmp(&specific(a, *a_spell))
             .then(a.severity.cmp(&b.severity))
@@ -839,7 +917,7 @@ fn resolve_overlaps(mut mapped: Vec<(Candidate, bool)>, dropped: &mut Vec<Droppe
             .then(a.start.cmp(&b.start))
     });
     let mut kept: Vec<Candidate> = Vec::new();
-    for (cand, _) in mapped {
+    for (mut cand, _, never_auto) in mapped {
         if let Some(winner) = kept.iter().find(|k| overlaps(k, &cand)) {
             dropped.push(Dropped {
                 harper_rule: cand.rule.clone(),
@@ -851,6 +929,10 @@ fn resolve_overlaps(mut mapped: Vec<(Candidate, bool)>, dropped: &mut Vec<Droppe
                 reason: "overlap",
             });
         } else {
+            if never_auto {
+                cand.severity = Severity::S3;
+                cand.confidence = cand.confidence.min(0.5);
+            }
             kept.push(cand);
         }
     }
@@ -1041,8 +1123,8 @@ mod tests {
             "{cands:?}"
         );
         assert!(
-            cands.iter().any(|c| c.severity == Severity::S1 && c.original.contains("the the")),
-            "repeated word: {cands:?}"
+            cands.iter().any(|c| c.severity == Severity::S3 && c.original.contains("the the")),
+            "a repeated word is S3, `had had` is correct English: {cands:?}"
         );
         let cands = checker().check("I saw an cat.", &dict);
         for c in &cands {
@@ -1052,6 +1134,65 @@ mod tests {
             cands.iter().any(|c| c.severity == Severity::S1 && c.replacement.ends_with("a")),
             "a/an: {cands:?}"
         );
+    }
+
+    #[test]
+    fn edits_across_words_are_never_auto() {
+        let dict = PersonalDictionary::default();
+        for (text, original) in [
+            ("Every one", "Every one"),
+            ("They had had", "had had"),
+            ("I know that that", "that that"),
+            ("The kids played out side", "out side"),
+            ("I need to up date", "up date"),
+            ("We waited a while", "a while"),
+            ("Please make sure to double check", "double check"),
+            ("We should check out the new web site", "web site"),
+            ("It is a good idea and also", "and also"),
+        ] {
+            let cands = checker().check(text, &dict);
+            let c = cands
+                .iter()
+                .find(|c| c.original == original)
+                .unwrap_or_else(|| panic!("{text}: no candidate for {original:?}: {cands:?}"));
+            assert_eq!(c.severity, Severity::S3, "{text}: {}", show(c));
+        }
+    }
+
+    #[test]
+    fn edit_of_one_word_in_a_span_is_narrowed_to_that_word() {
+        let text = "I do not want to loose";
+        let cands = checker().check(text, &PersonalDictionary::default());
+        let c = cands.iter().find(|c| c.replacement == "lose").unwrap_or_else(|| panic!("{cands:?}"));
+        assert_eq!((c.original.as_str(), slice(text, c.start, c.end).as_str()), ("loose", "loose"));
+        assert!(c.severity <= Severity::S1, "{}", show(c));
+    }
+
+    #[test]
+    fn doubled_letter_typos() {
+        for (typed, fix) in [("thhe", "the"), ("Outllook", "Outlook"), ("aaand", "and"), ("seentencees", "sentences"), ("soo", "so")] {
+            assert!(is_doubled_letter_typo(typed, fix), "{typed} -> {fix}");
+        }
+        for (typed, fix) in [("teh", "the"), ("the", "the"), ("htmlr", "humor"), ("hoow", "hood"), ("ok", "k"), ("11", "1")] {
+            assert!(!is_doubled_letter_typo(typed, fix), "{typed} -> {fix}");
+        }
+    }
+
+    #[test]
+    fn short_typos_are_s0_only_with_a_doubled_letter() {
+        let dict = PersonalDictionary::default();
+        for (text, typo) in [("I saw har", "har"), ("I want anb", "anb"), ("I said thw", "thw")] {
+            let cands = checker().check(text, &dict);
+            assert!(
+                cands.iter().filter(|c| c.original == typo).all(|c| c.severity >= Severity::S2),
+                "{text}: {cands:?}"
+            );
+        }
+        for (text, typo, fix) in [("It was soo", "soo", "so"), ("I think wwe", "wwe", "we")] {
+            let cands = checker().check(text, &dict);
+            let c = cands.iter().find(|c| c.original == typo).unwrap_or_else(|| panic!("{text}: {cands:?}"));
+            assert_eq!((c.replacement.as_str(), &c.severity), (fix, &Severity::S0), "{text}");
+        }
     }
 
     #[test]
