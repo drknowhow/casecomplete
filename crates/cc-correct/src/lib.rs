@@ -407,6 +407,32 @@ impl Checker {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Dictionary words `word` may be a typo of, one slip away (one edit, which may change the
+    /// first letter, or doubled keys), with their typing-error cost (lower is likelier), for
+    /// the language model to choose from once it has seen the sentence. Empty for a word not
+    /// to be guessed at whatever the sentence says: a known word (in any dialect or the
+    /// personal dictionary), one under four letters, one with a capital (a name or an
+    /// acronym), code, or an abbreviation (no vowel). Two slips are left out: they reach too
+    /// many words (`colud` is `could`, not `would`).
+    pub fn typo_options(&self, word: &str, dictionary: &PersonalDictionary) -> Vec<(String, f32)> {
+        let chars: Vec<char> = word.chars().collect();
+        if chars.len() < MIN_S0_LEN
+            || !chars.iter().all(|&c| c.is_alphabetic() || c == '\'')
+            || chars.iter().any(|c| c.is_uppercase())
+            || self.is_word(word, dictionary)
+            || is_code_like(word)
+        {
+            return Vec::new();
+        }
+        let lower: Vec<char> = chars.iter().map(|&c| lc(c)).collect();
+        self.scored_pool(word, &[])
+            .into_iter()
+            .filter(|s| (s.distance == 1 || is_doubled_letter_typo(word, &s.text)) && !looks_coined(&lower, &s.text))
+            .map(|s| (s.text, s.score))
+            .take(TYPO_OPTIONS)
+            .collect()
+    }
+
     fn rank_spelling(&self, original: &str, harper: &[String]) -> (String, Severity, f32) {
         let orig: Vec<char> = original.chars().collect();
         let lower: Vec<char> = orig.iter().map(|&c| lc(c)).collect();
@@ -417,6 +443,20 @@ impl Checker {
             return (harper[0].clone(), Severity::S1, 0.9);
         }
 
+        let scored = self.scored_pool(original, harper);
+        let Some(best) = scored.first() else {
+            // Nothing within distance 2: fall back to Harper's first (distant) suggestion.
+            return (harper[0].clone(), Severity::S2, 0.5);
+        };
+        self.decide_spelling(original, &orig, &lower, first_upper, best, scored.get(1))
+    }
+
+    /// Every dictionary word within `S0_MAX_DISTANCE` of `original`, cheapest typo first.
+    /// Harper's own suggestions (`harper`) head the pool, so their order breaks ties.
+    fn scored_pool(&self, original: &str, harper: &[String]) -> Vec<Scored> {
+        let orig: Vec<char> = original.chars().collect();
+        let lower: Vec<char> = orig.iter().map(|&c| lc(c)).collect();
+        let first_upper = orig.first().is_some_and(|c| c.is_uppercase());
         // Candidate pool: the suggestions Harper put on the lint (its order breaks ties), then
         // every dictionary word within edit distance 2 (Harper itself shows only the top 3).
         let mut pool: Vec<String> = Vec::new();
@@ -439,12 +479,6 @@ impl Checker {
             }
         }
 
-        struct Scored {
-            text: String,
-            distance: usize,
-            score: f32,
-            order: usize,
-        }
         let mut scored: Vec<Scored> = Vec::new();
         for (order, text) in pool.iter().enumerate() {
             let cand: Vec<char> = text.chars().map(lc).collect();
@@ -464,14 +498,21 @@ impl Checker {
             });
         }
         scored.sort_by(|a, b| a.score.total_cmp(&b.score).then(a.order.cmp(&b.order)));
+        scored
+    }
 
-        let Some(best) = scored.first() else {
-            // Nothing within distance 2: fall back to Harper's first (distant) suggestion.
-            return (harper[0].clone(), Severity::S2, 0.5);
-        };
-        let margin = scored
-            .get(1)
-            .map_or(f32::INFINITY, |second| second.score - best.score);
+    /// Severity and confidence of fixing `original` to the cheapest typo `best`, with the
+    /// runner-up `second`.
+    fn decide_spelling(
+        &self,
+        original: &str,
+        orig: &[char],
+        lower: &[char],
+        first_upper: bool,
+        best: &Scored,
+        second: Option<&Scored>,
+    ) -> (String, Severity, f32) {
+        let margin = second.map_or(f32::INFINITY, |second| second.score - best.score);
         let confidence = (1.0 - best.distance as f32 / orig.len() as f32).clamp(0.0, 1.0);
         let replacement = apply_case(original, &best.text);
         // A word the dictionary knows in another dialect (`colour`) is not a typo. A capitalised
@@ -503,6 +544,16 @@ impl Checker {
     }
 }
 
+/// A dictionary word scored as the intended spelling of a typo.
+struct Scored {
+    text: String,
+    distance: usize,
+    /// Typing-error cost, less the common-word bonus: lower is likelier.
+    score: f32,
+    /// Position in the pool, which puts Harper's own suggestions first on a tie.
+    order: usize,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------------------------
@@ -524,6 +575,8 @@ const S0_MIN_CONFIDENCE: f32 = 0.6;
 const S0_MIN_MARGIN: f32 = 0.2;
 /// Cost credit for a candidate that is a very common English word.
 const COMMON_WORD_BONUS: f32 = 0.5;
+/// Words `Checker::typo_options` offers at most.
+const TYPO_OPTIONS: usize = 12;
 
 // ---------------------------------------------------------------------------------------------
 // Typing-error model
@@ -1264,6 +1317,21 @@ mod tests {
         assert_eq!((c.replacement.as_str(), &c.severity), ("this", &Severity::S0));
         assert!(keeps_first_letter(&['h', 't', 'i', 's'], "this"));
         assert!(!keeps_first_letter(&['m', 'o', 'r', 't', 'h'], "north"));
+    }
+
+    #[test]
+    fn typo_options_offer_close_words_and_nothing_for_names_or_words() {
+        let dict = PersonalDictionary::default();
+        let morth = checker().typo_options("morth", &dict);
+        for word in ["north", "month"] {
+            assert!(morth.iter().any(|(o, _)| o == word), "{word} in {morth:?}");
+        }
+        let colud = checker().typo_options("colud", &dict);
+        assert!(colud.iter().any(|(o, _)| o == "could"), "{colud:?}");
+        assert!(!colud.iter().any(|(o, _)| o == "would"), "two slips away: {colud:?}");
+        for typed in ["Jonhson", "colour", "month", "xlsx", "teh", "snake_case"] {
+            assert!(checker().typo_options(typed, &dict).is_empty(), "{typed}");
+        }
     }
 
     #[test]
