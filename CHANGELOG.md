@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4 (2026-10-20)
+
+- The language model is asked about each word as you start typing it, so a fix that needs its view rarely holds back your keys
+- A misspelling with several possible fixes is fixed when the model clearly expects one of them in the sentence and the keyboard slip explains it; otherwise it is left as you typed it. These fixes are tracked as their own rule, `spell_context`, so undoing them demotes only them
+- A doubled-key fix can take the spelling the model expects instead, when the model's answer is already in
+- When the model is slow to answer (for example while another program keeps the GPU busy), fixes that need it are skipped rather than guessed
+
 ## 0.1.3 (2026-10-20)
 
 - Auto-fix no longer joins or splits words. An edit across two words (`out side`, `every one`, `had had`) is never applied automatically, and a fix replaces one word with one word unless it comes from your autocorrect list
