@@ -7,7 +7,7 @@
 //! happen only on the orchestrator thread (which calls `cc_context::init_thread`).
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use std::collections::{HashMap, HashSet};
@@ -53,6 +53,9 @@ const FIX_RECHECK_AFTER: Duration = Duration::from_millis(200);
 const MODEL_CHECK_TIMEOUT: Duration = Duration::from_millis(300);
 /// Next-token candidates asked for in that check.
 const MODEL_CHECK_TOKENS: u32 = 40;
+/// Rule of a spelling fix the language model chose (`App::settle`), so that its undos are
+/// counted, and it is demoted, apart from the typing model's fixes.
+const CONTEXT_RULE: &str = "spell_context";
 const DEFAULT_MODEL: &str = "gemma-3-1b-pt";
 /// Terminals: UIA reports the whole screen buffer, not an edit field, so the shadow buffer
 /// is the only context and editability is assumed.
@@ -65,14 +68,25 @@ enum Msg {
     Done { gen: u64, result: anyhow::Result<Completion> },
 }
 
-struct Req {
-    gen: u64,
-    prompt: String,
-    cancel: CancellationToken,
+enum Req {
+    /// Stream a completion of `prompt` back as `Msg::Token`s and a `Msg::Done`.
+    Complete { gen: u64, prompt: String, cancel: CancellationToken },
+    /// The likeliest next tokens after `prompt`, for a fix to check against; the engine
+    /// fills in `answer` unless `cancel` fires first.
+    NextTokens { prompt: String, answer: Answer, cancel: CancellationToken },
 }
 
-/// Engine runtime: receives prompts, streams tokens back as `Msg`.
-fn spawn_engine(client: CompletionClient, out: Sender<Msg>) -> tokio::sync::mpsc::UnboundedSender<Req> {
+/// The model's likeliest next tokens after a prompt, once the engine has them, or why not.
+type Answer = Arc<Mutex<Option<Result<Vec<(String, f32)>, String>>>>;
+
+/// Engine runtime: receives prompts, streams tokens back as `Msg`. Next-token questions go
+/// through `ask`, which keeps no idle connections: one llama-server has closed fails the
+/// next request on it (os error 10053).
+fn spawn_engine(
+    client: CompletionClient,
+    ask: CompletionClient,
+    out: Sender<Msg>,
+) -> tokio::sync::mpsc::UnboundedSender<Req> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Req>();
     std::thread::Builder::new()
         .name("cc-engine".into())
@@ -83,18 +97,37 @@ fn spawn_engine(client: CompletionClient, out: Sender<Msg>) -> tokio::sync::mpsc
                 .expect("tokio runtime");
             rt.block_on(async move {
                 while let Some(req) = rx.recv().await {
-                    let client = client.clone();
-                    let out = out.clone();
-                    tokio::spawn(async move {
-                        let gen = req.gen;
-                        let out_tok = out.clone();
-                        let result = client
-                            .complete_with_probs(&req.prompt, N_PREDICT, req.cancel, move |tok, logprob| {
-                                let _ = out_tok.send(Msg::Token { gen, text: tok.to_string(), logprob });
-                            })
-                            .await;
-                        let _ = out.send(Msg::Done { gen, result });
-                    });
+                    match req {
+                        Req::Complete { gen, prompt, cancel } => {
+                            let client = client.clone();
+                            let out = out.clone();
+                            tokio::spawn(async move {
+                                let out_tok = out.clone();
+                                let result = client
+                                    .complete_with_probs(&prompt, N_PREDICT, cancel, move |tok, logprob| {
+                                        let _ = out_tok.send(Msg::Token { gen, text: tok.to_string(), logprob });
+                                    })
+                                    .await;
+                                let _ = out.send(Msg::Done { gen, result });
+                            });
+                        }
+                        Req::NextTokens { prompt, answer, cancel } => {
+                            let ask = ask.clone();
+                            tokio::spawn(async move {
+                                // A withdrawn question is dropped here, closing its connection.
+                                let t0 = Instant::now();
+                                let top = tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        log::debug!("model question withdrawn after {} ms", t0.elapsed().as_millis());
+                                        return;
+                                    }
+                                    top = ask.next_tokens(&prompt, MODEL_CHECK_TOKENS) => top.map_err(|e| format!("{e:#}")),
+                                };
+                                log::debug!("model question answered in {} ms ({} chars)", t0.elapsed().as_millis(), prompt.len());
+                                *answer.lock().unwrap_or_else(|p| p.into_inner()) = Some(top);
+                            });
+                        }
+                    }
                 }
             });
         })
@@ -197,8 +230,10 @@ struct App {
     demoted: HashSet<String>,
     /// `(typed, fix)` pairs, lowercase, the user undid (`Store::undone_pairs`); never typed again.
     undone: HashSet<(String, String)>,
-    /// For the language model's second opinion on a fix; completions go through `engine`.
-    client: CompletionClient,
+    /// The prompt for the text before the word being typed, the model's answer to it, and
+    /// the token that withdraws the question: asked when the word started, so a fix at its
+    /// end rarely waits.
+    ahead: Option<(String, Answer, CancellationToken)>,
     /// (event id, applied at, shadow length right after) of the last auto fix awaiting an outcome.
     pending_fix_event: Option<(i64, Instant, usize)>,
     pending_completion_event: Option<i64>,
@@ -568,7 +603,7 @@ impl App {
         self.gen += 1;
         self.req_started = Some(Instant::now());
         self.first_token_logged = false;
-        let _ = self.engine.send(Req { gen: self.gen, prompt: ctx, cancel: self.cancel.clone() });
+        let _ = self.engine.send(Req::Complete { gen: self.gen, prompt: ctx, cancel: self.cancel.clone() });
     }
 
     /// The model prompt for `ctx`: recently accepted sentences in this app give the base
@@ -582,34 +617,96 @@ impl App {
         }
     }
 
-    /// Why the language model stops the fix of `typo` to `fix`, if it does: it clearly
-    /// expects another dictionary word close to `typo` after `before` (the text up to the
-    /// typo; `fixgate::model_prefers`), or it gave no answer in time. None lets the fix go
-    /// in; so does having no engine, or no text before the typo to ask about.
-    fn model_objection(&self, before: &str, typo: &str, fix: &str) -> Option<String> {
-        self.sidecar.as_ref()?;
-        let ctx = before.trim_end_matches(' ');
-        if ctx.trim().is_empty() {
+    /// The model's answer to `prompt`: the one already asked for, or a new question. A
+    /// new question withdraws the last one, so that on a busy engine questions about words
+    /// already typed do not queue up in front of it.
+    fn ask_model(&mut self, prompt: String) -> Answer {
+        if let Some((asked, answer, cancel)) = &self.ahead {
+            if *asked == prompt {
+                return answer.clone();
+            }
+            cancel.cancel();
+        }
+        let answer: Answer = Arc::new(Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let _ = self.engine.send(Req::NextTokens { prompt: prompt.clone(), answer: answer.clone(), cancel: cancel.clone() });
+        self.ahead = Some((prompt, answer.clone(), cancel));
+        answer
+    }
+
+    /// A word was just started: ask the model now what may follow the text before it, so a
+    /// fix at the word's end finds the answer there. Only where a completion could go.
+    fn ask_ahead(&mut self) {
+        if self.sidecar.is_none() || self.auto_level.is_none() || !self.field_allowed() {
+            return;
+        }
+        let text = self.shadow.text();
+        let Some(last) = text.chars().last() else { return };
+        let before = text[..text.len() - last.len_utf8()].trim_end_matches(' ');
+        if before.trim().is_empty() || privacy::sensitive(before).is_some() {
+            return;
+        }
+        let prompt = self.prompt_for(before.to_string());
+        self.ask_model(prompt);
+    }
+
+    /// The model's answer about `ctx` if it is already in: one asked for when the word
+    /// started. Never asks and never waits.
+    fn model_top_now(&self, ctx: &str) -> Option<Vec<(String, f32)>> {
+        let prompt = self.prompt_for(ctx.to_string());
+        let (asked, answer, _) = self.ahead.as_ref()?;
+        if *asked != prompt {
             return None;
         }
-        let prompt = self.prompt_for(ctx.to_string());
-        let client = self.client.clone();
+        let top = answer.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        top.ok()
+    }
+
+    /// The model's likeliest next tokens after `ctx`, the text up to a typo. Err when the
+    /// engine gives no answer within `MODEL_CHECK_TIMEOUT`.
+    fn model_top(&mut self, ctx: &str) -> Result<Vec<(String, f32)>, String> {
+        let answer = self.ask_model(self.prompt_for(ctx.to_string()));
         let t0 = Instant::now();
-        let asked = self.rt.block_on(async move {
-            tokio::time::timeout(MODEL_CHECK_TIMEOUT, client.next_tokens(&prompt, MODEL_CHECK_TOKENS)).await
-        });
-        let ms = t0.elapsed().as_millis();
-        let top = match asked {
-            Ok(Ok(top)) => top,
-            Ok(Err(e)) => {
-                log::debug!("model check failed after {ms} ms: {e:#}");
-                return Some("the model gave no answer".into());
+        loop {
+            if let Some(top) = answer.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+                log::debug!("model check answered {} ms after the word", t0.elapsed().as_millis());
+                return top.map_err(|e| {
+                    log::debug!("model check failed: {e}");
+                    "the model gave no answer".to_string()
+                });
             }
-            Err(_) => return Some(format!("the model gave no answer within {ms} ms")),
-        };
-        log::debug!("model check answered in {ms} ms");
-        fixgate::model_prefers(typo, fix, &top, |w| self.checker.is_word(w, &self.dict))
-            .map(|word| format!("the model expects {word:?}"))
+            if t0.elapsed() >= MODEL_CHECK_TIMEOUT {
+                return Err(format!("the model gave no answer within {} ms", MODEL_CHECK_TIMEOUT.as_millis()));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The word to type for the spelling fix `c` once the language model has read `before`,
+    /// the text up to the typo, or why nothing is typed. The model may pick another of the
+    /// typo's spellings than the typing model did (`fixgate::model_pick`); a `guess`, which
+    /// the rules could not settle, needs that pick. Without one, a rules fix goes in unless
+    /// the model clearly expects another word close to the typo (`fixgate::model_prefers`).
+    /// With no engine, or no text before the typo to ask about, a rules fix goes in as it is.
+    fn settle(&mut self, before: &str, c: &cc_correct::Candidate, guess: bool) -> Result<String, String> {
+        let ctx = before.trim_end_matches(' ');
+        if self.sidecar.is_none() || ctx.trim().is_empty() {
+            return if guess { Err("there is no model to ask".into()) } else { Ok(c.replacement.clone()) };
+        }
+        let top = self.model_top(ctx)?;
+        if !self.demoted.contains(CONTEXT_RULE) {
+            let options = self.checker.typo_options(&c.original, &self.dict);
+            if let Some(pick) = fixgate::model_pick(&c.original, &options, &top) {
+                return Ok(pick);
+            }
+        }
+        if guess {
+            return Err("the model expects none of its spellings".into());
+        }
+        match fixgate::model_prefers(&c.original, &c.replacement, &top, |w| self.checker.is_word(w, &self.dict)) {
+            Some(word) => Err(format!("the model expects {word:?}")),
+            None => Ok(c.replacement.clone()),
+        }
     }
 
     fn show_ghost(&mut self) {
@@ -721,6 +818,9 @@ impl App {
         // punctuation after it was already looked up when that punctuation was typed.
         let core = word.trim_start_matches(|c: char| !c.is_alphanumeric());
         let listed = if core.ends_with(char::is_alphanumeric) { self.auto.lookup(core) } else { None };
+        // A misspelling the rules leave open (S2) is a guess: the language model may choose
+        // one of its spellings (`settle`).
+        let mut guess = false;
         let candidate = match listed {
             Some(fix) => Some(cc_correct::Candidate {
                 start: n_chars - core.chars().count(),
@@ -731,22 +831,33 @@ impl App {
                 severity: Severity::S0,
                 confidence: 1.0,
             }),
-            None => self
-                .checker
-                .check(&sentence, &self.dict)
-                .into_iter()
-                .find(|c| {
-                    c.end == n_chars
+            None => {
+                let mut found = self.checker.check(&sentence, &self.dict);
+                let at_end = |c: &cc_correct::Candidate| c.end == n_chars && sentence.ends_with(&c.original);
+                let ruled = found.iter().position(|c| {
+                    at_end(c)
                         && fixgate::eligible(&c.severity, &c.rule, &c.original, &c.replacement, &level)
-                        && sentence.ends_with(&c.original)
                         && !self.demoted.contains(&c.rule)
-                }),
+                });
+                let open = || {
+                    found.iter().position(|c| {
+                        at_end(c)
+                            && c.rule == "spell"
+                            && c.severity == Severity::S2
+                            && self.sidecar.is_some()
+                            && !self.demoted.contains(CONTEXT_RULE)
+                            && !self.checker.typo_options(&c.original, &self.dict).is_empty()
+                    })
+                };
+                let at = ruled.or_else(|| open().inspect(|_| guess = true));
+                at.map(|i| found.swap_remove(i))
+            }
         };
-        let Some(c) = candidate else {
+        let Some(mut c) = candidate else {
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
         };
-        if self.undone.contains(&(c.original.to_lowercase(), c.replacement.to_lowercase())) {
+        if !guess && self.undone.contains(&(c.original.to_lowercase(), c.replacement.to_lowercase())) {
             log::info!("fix {:?} -> {:?} [{}] not applied: undone before", c.original, c.replacement, c.rule);
             self.prev_boundary = Some((word, self.shadow.text().chars().count()));
             return;
@@ -772,29 +883,62 @@ impl App {
             self.prev_boundary = None;
             return;
         }
-        let check_ms = t0.elapsed().as_millis() as u32;
-        log::info!(
-            "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
-            c.original, c.replacement, c.rule, c.severity, c.confidence, check_ms
-        );
         self.prev_boundary = None;
         self.cancel_ghost();
-        // A typing-model pick other than a doubled letter gets the language model's view of
-        // the word, with keys captured meanwhile so the field stays put.
-        if c.rule == "spell" && c.severity == Severity::S0 && !cc_correct::is_doubled_letter_typo(&c.original, &c.replacement) {
+        // A spelling the typing model guessed, other than doubled keys, gets the language
+        // model's view of the word first, with keys captured meanwhile so the field stays put.
+        let guessed = c.rule == "spell" && c.severity == Severity::S0 && !cc_correct::is_doubled_letter_typo(&c.original, &c.replacement);
+        if guess || guessed {
             if !self.swallow.begin_capture(self.applied) {
                 log::info!("fix not applied: typed ahead of it");
                 return;
             }
             let text = self.shadow.text();
             let before = text[..text.len() - boundary.len_utf8() - c.original.len()].to_string();
-            if let Some(why) = self.model_objection(&before, &c.original, &c.replacement) {
-                log::info!("fix {:?} -> {:?} not applied: {why}", c.original, c.replacement);
+            match self.settle(&before, &c, guess) {
+                Ok(fix) => {
+                    if guess || fix != c.replacement {
+                        c.rule = CONTEXT_RULE.into();
+                    }
+                    c.replacement = fix;
+                }
+                Err(why) => {
+                    log::info!("fix {:?} -> {:?} [{}] not applied: {why}", c.original, c.replacement, c.rule);
+                    self.end_capture();
+                    self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+                    return;
+                }
+            }
+            if self.undone.contains(&(c.original.to_lowercase(), c.replacement.to_lowercase())) {
+                log::info!("fix {:?} -> {:?} [{}] not applied: undone before", c.original, c.replacement, c.rule);
                 self.end_capture();
                 self.prev_boundary = Some((word, self.shadow.text().chars().count()));
                 return;
             }
         }
+        // Doubled keys are fixed without waiting for the model, but when its view of the
+        // word is already in, it may pick another spelling (`madd` after `It` is `made`).
+        if !guess && !guessed && c.rule == "spell" && !self.demoted.contains(CONTEXT_RULE) {
+            let text = self.shadow.text();
+            let before = text[..text.len() - boundary.len_utf8() - c.original.len()].trim_end_matches(' ').to_string();
+            let pick = self.model_top_now(&before).and_then(|top| {
+                fixgate::model_pick(&c.original, &self.checker.typo_options(&c.original, &self.dict), &top)
+            });
+            if let Some(pick) = pick.filter(|p| *p != c.replacement) {
+                if self.undone.contains(&(c.original.to_lowercase(), pick.to_lowercase())) {
+                    log::info!("fix {:?} -> {:?} [{CONTEXT_RULE}] not applied: undone before", c.original, pick);
+                    self.prev_boundary = Some((word, self.shadow.text().chars().count()));
+                    return;
+                }
+                c.rule = CONTEXT_RULE.into();
+                c.replacement = pick;
+            }
+        }
+        let check_ms = t0.elapsed().as_millis() as u32;
+        log::info!(
+            "fix {:?} -> {:?} [{} {:?} {:.2}] checked in {} ms",
+            c.original, c.replacement, c.rule, c.severity, c.confidence, check_ms
+        );
         let caret = cc_context::caret_rect();
         let mut typed = c.replacement.clone();
         typed.push(boundary);
@@ -1151,6 +1295,12 @@ impl App {
                     self.on_word_boundary(c);
                     if self.last_fix.is_some() {
                         return;
+                    }
+                } else if c.is_alphanumeric() {
+                    let text = self.shadow.text();
+                    let prev = text[..text.len() - c.len_utf8()].chars().next_back();
+                    if prev.is_some_and(|p| p.is_whitespace() || fixgate::closes_word(p)) {
+                        self.ask_ahead();
                     }
                 }
                 if self.ghost_visible && self.ghost.starts_with(c) {
@@ -1648,10 +1798,7 @@ fn start() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
 
     let (tx, rx) = unbounded::<Msg>();
-    let engine = spawn_engine(CompletionClient::new(&sidecar_url()), tx.clone());
-    // Its own client: a pooled connection is driven by the runtime that opened it, and this
-    // one runs only while the orchestrator waits on a model check. So it keeps none.
-    let client = CompletionClient::unpooled(&sidecar_url());
+    let engine = spawn_engine(CompletionClient::new(&sidecar_url()), CompletionClient::unpooled(&sidecar_url()), tx.clone());
 
     let overlay = Overlay::new().context("overlay")?;
     let swallow = Arc::new(SwallowState::default());
@@ -1732,7 +1879,7 @@ fn start() -> anyhow::Result<()> {
         paused_until: None,
         demoted,
         undone,
-        client,
+        ahead: None,
         pending_fix_event: None,
         pending_completion_event: None,
         completion_latency_ms: 0,

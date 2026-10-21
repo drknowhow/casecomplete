@@ -149,6 +149,77 @@ pub fn model_prefers(typo: &str, fix: &str, top: &[(String, f32)], is_word: impl
     (lp - fix_lp >= 4f32.ln()).then_some(word)
 }
 
+/// How likely the word [`model_pick`] returns must be as the next token, at least.
+const PICK_FLOOR: f32 = -4.6; // ln 0.01
+/// Nats of model likelihood that one unit of typing-error cost is worth in [`model_pick`].
+const COST_WEIGHT: f32 = 2.0;
+
+/// The word the language model clearly expects where `typo` was typed, among the words the
+/// typo may stand for (`options`: word and typing-error cost, from `Checker::typo_options`),
+/// given the model's likeliest next tokens (`top`) after the text before the typo. Each
+/// option scores how likely the model finds it next, as a whole word token (` month`), less
+/// what its typo costs, so a likely word the keys do not explain loses. The best must be
+/// in the list, and score four times higher than anything else that could be meant there:
+/// another option, a token that starts the typo or an option (` doc` may begin what was
+/// typed), or the word as typed, which is as likely as the last token in the list for all
+/// the model says. `this morth` gives `month`. After `for the`, `calory` gives nothing,
+/// since the model expects neither `calorie` nor `color` there.
+pub fn model_pick(typo: &str, options: &[(String, f32)], top: &[(String, f32)]) -> Option<String> {
+    model_pick_tuned(typo, options, top, COST_WEIGHT, true)
+}
+
+/// [`model_pick`] with its cost weight, and with or without the word as typed as a rival
+/// (`typed_rival`), for tuning (examples/fix_eval.rs).
+pub fn model_pick_tuned(
+    typo: &str,
+    options: &[(String, f32)],
+    top: &[(String, f32)],
+    weight: f32,
+    typed_rival: bool,
+) -> Option<String> {
+    let typo = typo.to_lowercase();
+    let floor = top.iter().map(|(_, lp)| *lp).reduce(f32::min)?;
+    // Whole-word tokens; one without a leading space would continue the word before the typo.
+    let words: Vec<(String, f32)> = top
+        .iter()
+        .filter_map(|(token, lp)| {
+            let word = token.to_lowercase().strip_prefix(' ')?.to_string();
+            (!word.is_empty() && word.chars().all(char::is_alphabetic)).then_some((word, *lp))
+        })
+        .collect();
+    let listed = |w: &str| words.iter().find(|(t, _)| t == w).map(|(_, lp)| *lp);
+    let options: Vec<(String, f32)> = options.iter().map(|(o, cost)| (o.to_lowercase(), *cost)).collect();
+    // (option, its token's log probability if listed, score); an option not in the list is
+    // at most as likely as the floor.
+    let scored: Vec<(&str, Option<f32>, f32)> = options
+        .iter()
+        .map(|(o, cost)| {
+            let lp = listed(o);
+            (o.as_str(), lp, lp.unwrap_or(floor) - weight * cost)
+        })
+        .collect();
+    let (best_at, &(word, lp, score)) = scored
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, lp, _))| lp.is_some())
+        .max_by(|a, b| a.1 .2.total_cmp(&b.1 .2))?;
+    let mut rival = if typed_rival { floor } else { f32::NEG_INFINITY };
+    for (at, (_, _, other)) in scored.iter().enumerate() {
+        if at != best_at {
+            rival = rival.max(*other);
+        }
+    }
+    for (token, token_lp) in &words {
+        let is_option = options.iter().any(|(o, _)| o == token);
+        let starts = typo.starts_with(token.as_str()) || options.iter().any(|(o, _)| o.starts_with(token.as_str()));
+        if !is_option && token.chars().count() >= 2 && starts {
+            rival = rival.max(*token_lp);
+        }
+    }
+    let lp = lp?;
+    (lp >= PICK_FLOOR && score - rival >= 4f32.ln()).then(|| word.to_string())
+}
+
 /// The end of `s` with letters written as `a` or `A` and digits as `0`, for the log: it
 /// shows a joined or doubled word without showing what was typed.
 pub fn shape(s: &str) -> String {
@@ -447,6 +518,31 @@ mod tests {
             None,
             "not four times as likely"
         );
+    }
+
+    #[test]
+    fn model_pick_takes_the_option_the_model_clearly_expects() {
+        let top = |pairs: &[(&str, f32)]| pairs.iter().map(|(t, lp)| (t.to_string(), *lp)).collect::<Vec<_>>();
+        let options = |words: &[(&str, f32)]| words.iter().map(|(w, c)| (w.to_string(), *c)).collect::<Vec<_>>();
+        let morth = options(&[("north", 0.3), ("moth", 0.6), ("month", 0.9), ("worth", 1.4)]);
+        let after_this = top(&[(" month", -1.2), (" week", -1.9), (" year", -2.0), (" north", -5.0), (" time", -6.0)]);
+        assert_eq!(model_pick("morth", &morth, &after_this).as_deref(), Some("month"));
+        // Neither option is expected: nothing below the list can be ruled out.
+        let after_the = top(&[(" meeting", -1.4), (" next", -2.7), (" first", -2.8), (" time", -3.9)]);
+        assert_eq!(model_pick("calory", &options(&[("calorie", 1.0)]), &after_the), None);
+        // Close to another option once the typing cost counts.
+        let close = top(&[(" month", -1.2), (" moth", -1.9), (" time", -6.0)]);
+        assert_eq!(model_pick("morth", &morth, &close), None);
+        // Likely, but the keys do not explain it well enough.
+        let costly = top(&[(" worth", -1.5), (" time", -4.5)]);
+        assert_eq!(model_pick("morth", &morth, &costly), None);
+        // A token the typo starts with may be the start of the word as typed.
+        let typed = top(&[(" document", -2.0), (" doc", -2.5), (" time", -6.0)]);
+        assert_eq!(model_pick("documnet", &options(&[("document", 0.4)]), &typed), None);
+        // Too unlikely on its own, and a token that continues the word before is not a word.
+        assert_eq!(model_pick("morth", &morth, &top(&[(" month", -5.0), (" a", -9.0)])), None);
+        assert_eq!(model_pick("morth", &morth, &top(&[("month", -0.5), (" a", -6.0)])), None);
+        assert_eq!(model_pick("morth", &morth, &[]), None);
     }
 
     #[test]
