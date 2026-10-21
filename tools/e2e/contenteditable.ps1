@@ -20,7 +20,7 @@ param(
   [string[]]$Fixes = @("wwant=want", "thhe=the", "aree=are", "mmore=more", "throughh=through",
     "thhat=that", "haave=have", "teh=the", "meetting=meeting", "Outllook=Outlook",
     "wiht=with", "recieve=receive", "definately=definitely", "documnet=document",
-    "yestreday=yesterday", "pakage=package"),
+    "yestreday=yesterday", "pakage=package", "morth=month"),
   [int]$CadenceMs = 45,
   [int]$AfterSpaceMs = 12,
   [int]$Runs = 3,
